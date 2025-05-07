@@ -1,8 +1,9 @@
 import torch
+import os
 import torch.nn as nn
 import torch.utils.data
 import torch.nn.functional as F
-from pointnet_utils import PointNetEncoder, feature_transform_reguliarzer
+from models.encoders.pointnet.pointnet_utils import PointNetEncoder, feature_transform_reguliarzer
 
 class get_model(nn.Module):
     def __init__(self, k=40, normal_channel=True):
@@ -49,7 +50,9 @@ def get_pointnet_encoder():
     pointnet = get_model(normal_channel=False)
     
     # Load the checkpoint
-    checkpoint = torch.load('pointnet.pth')
+    current_path = os.path.dirname(os.path.abspath(__file__))
+    checkpoint_path = os.path.join(current_path, 'pointnet.pth')
+    checkpoint = torch.load(checkpoint_path)
     
     # Load the state dict
     pointnet.load_state_dict(checkpoint['model_state_dict'])

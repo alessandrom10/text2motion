@@ -1,6 +1,6 @@
 import os
 import torch
-from dataset import TextToMotionDataset
+from dataset.dataset import TextToMotionDataset
 import h5py
 
 class DFaustDataset(TextToMotionDataset):
@@ -17,7 +17,9 @@ class DFaustDataset(TextToMotionDataset):
         current_gender = None
         current_sequence = []
 
-        file_path = os.path.join(self.root_dir, "subjects_and_sequences.txt")
+        # get current path
+        current_path = os.path.dirname(os.path.abspath(__file__))
+        file_path = os.path.join(current_path, self.root_dir, "subjects_and_sequences.txt")
 
         with open(file_path, 'r') as f:
             for line in f:
@@ -45,10 +47,13 @@ class DFaustDataset(TextToMotionDataset):
         currentid, currentgender, currentseq = animation
         
         sidseq = str(currentid) + '_' + currentseq
+
+        current_path = os.path.dirname(os.path.abspath(__file__))
+
         if (currentgender == "male"):
-            file_path = os.path.join(self.root_dir, "registrations_m.hdf5")
+            file_path = os.path.join(current_path, self.root_dir, "registrations_m.hdf5")
         else:
-            file_path = os.path.join(self.root_dir, "registrations_f.hdf5")
+            file_path = os.path.join(current_path, self.root_dir, "registrations_f.hdf5")
 
         with h5py.File(file_path, 'r') as f:
             verts = f[sidseq][()].transpose([2, 0, 1])
@@ -57,6 +62,12 @@ class DFaustDataset(TextToMotionDataset):
         # convert verts and faces to torch tensors
         verts = torch.tensor(verts, dtype=torch.float32)
         faces = faces.astype(int)
+
+        # normalize the mesh
+        centroid = torch.mean(verts[0], dim=0)
+        verts = verts - centroid
+        m = torch.max(torch.sqrt(torch.sum(verts**2, dim=1)))
+        verts = verts / m
 
         return verts, faces
 
