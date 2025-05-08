@@ -112,9 +112,15 @@ class DFaustAnimator:
         to_show = min(self.num_to_show, len(samples))
         logger.info(f"Showing {to_show} animation(s)")
 
+        action_descriptions_dict = self.dataset.action_descriptions
+        if not action_descriptions_dict:
+            logger.warning("No action descriptions found.")
+
         for i in range(to_show):
             anim_id, anim_name = samples[i]
             logger.info(f"[{i + 1}/{to_show}] {anim_name}")
+            description = action_descriptions_dict.get(anim_name, "No description available for this action.")
+            logger.info(f"Description: {description}")
             try:
                 verts, faces = self.dataset._load_animation(anim_id)
                 verts_np = self._prepare_vertices(verts)

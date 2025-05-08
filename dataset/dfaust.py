@@ -2,6 +2,7 @@ import os
 import torch
 from dataset.dataset import TextToMotionDataset
 import h5py
+import json
 
 class DFaustDataset(TextToMotionDataset):
 
@@ -73,3 +74,24 @@ class DFaustDataset(TextToMotionDataset):
 
     def _load_text(self, text):
         return text
+    
+    def _load_action_descriptions(self):
+        """
+        Loads action descriptions from 'action_descriptions.json'
+        located in the dataset's root directory.
+        """
+        current_path = os.path.dirname(os.path.abspath(__file__))
+        json_file_path = os.path.join(current_path, self.root_dir, "action_descriptions.json")
+        
+        descriptions = {}
+        try:
+            with open(json_file_path, 'r', encoding='utf-8') as f:
+                descriptions = json.load(f)
+        except FileNotFoundError:
+            raise FileNotFoundError(f"Action descriptions file not found at {json_file_path}. Please ensure the file exists.")
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Error decoding JSON from {json_file_path}: {e}")
+        except Exception as e: # Catch any other unexpected error during loading
+            raise RuntimeError(f"Failed to load action descriptions: {e}")
+
+        return descriptions

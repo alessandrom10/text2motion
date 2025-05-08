@@ -1,5 +1,3 @@
-import os
-import torch
 from torch.utils.data import Dataset
 from abc import ABC, abstractmethod
 
@@ -13,6 +11,7 @@ class TextToMotionDataset(Dataset, ABC):
         self.samples = []  # List of (animation, text) tuples
         
         self._prepare_samples()
+        self.action_descriptions = self._load_action_descriptions()
 
     @abstractmethod
     def _prepare_samples(self):
@@ -48,5 +47,15 @@ class TextToMotionDataset(Dataset, ABC):
         """
         Load text data
         Returns the text as a string
+        """
+        pass
+
+    @abstractmethod
+    def _load_action_descriptions(self):
+        """
+        Abstract method to load action descriptions.
+        Subclasses must implement this to return a dictionary mapping
+        action names (str) to their descriptions (str).
+        An empty dictionary should be returned if loading fails.
         """
         pass
