@@ -62,6 +62,54 @@ class TimestepEmbedder(nn.Module):
         time_enc = self.time_pos_encoder_pe[timesteps.long()] # [bs, latent_dim]
         return self.mlp(time_enc) # [bs, latent_dim]
 
+
+# --- Option 2: GRU-based TimestepEmbedder ---
+
+class TimestepEmbedderGRU(nn.Module):
+    def __init__(self, latent_dim: int, pos_encoder: PositionalEncoding, 
+                    gru_num_layers: int = 1, gru_dropout: float = 0.0
+                ):
+        """
+        Timestep embedding for diffusion models using a GRU.
+
+        :param latent_dim: Dimension of the latent space (output dimension).
+        :param pos_encoder: Positional encoding instance. Its 'pe' table is used.
+        :param gru_num_layers: Number of layers in the GRU.
+        :param gru_dropout: Dropout probability for GRU if gru_num_layers > 1.
+        """
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.time_pos_encoder_pe = pos_encoder.pe.squeeze(0) # [max_len, latent_dim]
+        
+        self.gru = nn.GRU(
+            input_size=latent_dim,    # Input features to GRU is latent_dim (from pos_encoder)
+            hidden_size=latent_dim,   # GRU hidden size, outputting to latent_dim
+            num_layers=gru_num_layers,
+            batch_first=True,         # Expects input as [batch, seq_len, features]
+            dropout=gru_dropout if gru_num_layers > 1 else 0.0
+        )
+
+    def forward(self, timesteps: torch.Tensor) -> torch.Tensor: # timesteps: [bs]
+        """
+        Forward pass for GRU-based timestep embedding.
+        :param timesteps: Tensor of shape [batch_size] containing timestep indices.
+        :return: Timestep embedding of shape [batch_size, latent_dim].
+        """
+        t_pos_enc = self.time_pos_encoder_pe[timesteps.long()] # [bs, latent_dim]
+        t_pos_enc_seq = t_pos_enc.unsqueeze(1) # Convert to [bs, seq_len=1, latent_dim] for GRU
+        
+        # output_seq: [bs, 1, latent_dim], last_hidden: [num_gru_layers, bs, latent_dim]
+        _, last_hidden = self.gru(t_pos_enc_seq)
+        
+        # Use the hidden state of the last GRU layer
+        time_emb = last_hidden[-1] # Takes the hidden state from the top-most layer -> [bs, latent_dim]
+
+        # Optional: if self.final_mlp exists:
+        # time_emb = self.final_mlp(time_emb)
+            
+        return time_emb
+
+
 # --- MDM with Armature Class Conditioning ---
 
 class ArmatureMDM(nn.Module):
@@ -85,6 +133,9 @@ class ArmatureMDM(nn.Module):
                     # Optional final MLP refinement for algebraic armature integration
                     use_final_algebraic_refinement_encoder: bool = True,
                     algebraic_refinement_hidden_dim: Optional[int] = None, # Hidden dim for the final refinement MLP
+                    timestep_embedder_type: Literal["mlp", "gru"] = "mlp",
+                    timestep_gru_num_layers: int = 1, # Used if timestep_embedder_type is "gru"
+                    timestep_gru_dropout: float = 0.0  # Used if timestep_embedder_type is "gru"
                 ):
         """
         Armature-conditioned Motion Diffusion Model (ArmatureMDM).
@@ -107,6 +158,9 @@ class ArmatureMDM(nn.Module):
         :param use_final_algebraic_refinement_encoder: Whether to use an MLP after the final algebraic
                                                        integration of the armature embedding.
         :param algebraic_refinement_hidden_dim: Hidden dim for the final refinement MLP. If None, uses latent_dim.
+        :param timestep_embedder_type: Type of timestep embedder ("mlp" or "gru").
+        :param timestep_gru_num_layers: Number of GRU layers if using GRU-based timestep embedder.
+        :param timestep_gru_dropout: Dropout probability for GRU layers if using GRU-based timestep embedder.
         """
         super().__init__()
 
@@ -124,7 +178,19 @@ class ArmatureMDM(nn.Module):
         self.pos_encoder = PositionalEncoding(latent_dim, dropout, max_len=max_seq_len)
         
         # 3. Timestep Embedding
-        self.time_embedder = TimestepEmbedder(latent_dim, self.pos_encoder)
+        if timestep_embedder_type.lower() == "gru":
+            logger.info(f"Using GRU-based TimestepEmbedder (GRU layers: {timestep_gru_num_layers}).")
+            self.time_embedder = TimestepEmbedderGRU(
+                latent_dim, 
+                self.pos_encoder, 
+                gru_num_layers=timestep_gru_num_layers,
+                gru_dropout=timestep_gru_dropout
+            )
+        elif timestep_embedder_type.lower() == "mlp":
+            logger.info("Using MLP-based TimestepEmbedder (classic).")
+            self.time_embedder = TimestepEmbedder(latent_dim, self.pos_encoder)
+        else:
+            raise ValueError(f"Unsupported timestep_embedder_type: {timestep_embedder_type}. Choose 'mlp' or 'gru'.")
         
         # 4. Text Conditioning (Sentence-BERT)
         logger.info(f"Loading Sentence-BERT model: {sbert_model_name}...")
