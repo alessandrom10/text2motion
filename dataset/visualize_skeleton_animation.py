@@ -5,7 +5,7 @@ from matplotlib.animation import FuncAnimation
 t2m_kinematic_chain = [[0, 2, 5, 8, 11], [0, 1, 4, 7, 10], [0, 3, 6, 9, 12, 15], [9, 14, 17, 19, 21], [9, 13, 16, 18, 20]]
 
 # Upload joints and center on root (index 0)
-joints = np.load('.data/HumanML3D/new_joints/000000.npy')                        # (T,22,3)
+joints = np.load('./data/HumanML3D/new_joints/000000.npy')                        # (T,22,3)
 joints = joints - joints[:, 0:1, :]                     # root→origin
 joints_m = joints / 1000.0                              # mm→m
 
