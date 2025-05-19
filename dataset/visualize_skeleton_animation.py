@@ -71,4 +71,4 @@ anim = FuncAnimation(fig, update,
                      blit=True,
                      interval=1000/30)
 
-anim.save('scheleton.gif', writer='imagemagick', fps=30)
+anim.save('skeleton.gif', writer='imagemagick', fps=30)
