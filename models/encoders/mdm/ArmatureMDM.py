@@ -11,6 +11,12 @@ logger = logging.getLogger(__name__)
 # --- Helper Modules (PositionalEncoding and TimestepEmbedder) ---
 
 class PositionalEncoding(nn.Module):
+    """
+    Positional Encoding module for Transformer models.
+    This module generates positional encodings for input sequences, which are added to the input embeddings.
+    The encodings are based on sine and cosine functions of different frequencies.
+    """
+
     def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
         """
         Positional encoding for Transformer models.
@@ -36,6 +42,12 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 class TimestepEmbedder(nn.Module):
+    """
+    Timestep embedding for diffusion models.
+    This module generates embeddings for timesteps, which are used to condition the model on the current timestep.
+    The embeddings are based on a positional encoding table and an MLP.
+    """
+
     def __init__(self, latent_dim: int, pos_encoder: PositionalEncoding):
         """
         Timestep embedding for diffusion models.
@@ -66,6 +78,12 @@ class TimestepEmbedder(nn.Module):
 # --- Option 2: GRU-based TimestepEmbedder ---
 
 class TimestepEmbedderGRU(nn.Module):
+    """
+    Timestep embedding for diffusion models using a GRU.
+    This module generates embeddings for timesteps, which are used to condition the model on the current timestep.
+    The embeddings are based on a positional encoding table and a GRU layer.
+    """
+
     def __init__(self, latent_dim: int, pos_encoder: PositionalEncoding, 
                     gru_num_layers: int = 1, gru_dropout: float = 0.0
                 ):
@@ -113,6 +131,12 @@ class TimestepEmbedderGRU(nn.Module):
 # --- MDM with Armature Class Conditioning ---
 
 class ArmatureMDM(nn.Module):
+    """
+    Armature-conditioned Motion Diffusion Model (ArmatureMDM).
+    This model integrates motion features with text and armature class conditions using a Transformer backbone.
+    It supports two-stage conditioning policies for text-time and armature integration.
+    """
+    
     def __init__(self,
                     num_motion_features: int,
                     latent_dim: int = 768,
