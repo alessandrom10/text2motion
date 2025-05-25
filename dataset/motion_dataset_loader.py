@@ -1,0 +1,282 @@
+import torch
+from torch.utils.data import Dataset, DataLoader
+from torch.nn.utils.rnn import pad_sequence
+import pandas as pd
+import numpy as np
+import os
+import logging
+from typing import Callable, Optional, List, Dict, Any
+from dataset.dataset import TextToMotionDataset
+
+logger = logging.getLogger(__name__)
+
+# --- Default Utility Functions ---
+def default_uniform_timestep_sampler(num_diffusion_timesteps: int) -> int:
+    """
+    Samples a timestep uniformly at random.
+    :param num_diffusion_timesteps: The total number of diffusion timesteps (T).
+    :return: A randomly sampled integer timestep t (from 0 to T-1).
+    """
+    return torch.randint(0, num_diffusion_timesteps, (1,)).item()
+
+def default_gaussian_noise_fn(target_x0_shape: tuple, device: torch.device) -> torch.Tensor:
+    """
+    Generates standard Gaussian noise with the given shape and device.
+    :param target_x0_shape: The shape of the target_x0 tensor (e.g., (num_frames, num_features)).
+    :param device: The device to create the noise tensor on.
+    :return: A noise tensor epsilon.
+    """
+    return torch.randn(target_x0_shape, device=device)
+
+def default_ddpm_noising_fn(target_x0: torch.Tensor,
+                             epsilon: torch.Tensor,
+                             t: int,
+                             alphas_cumprod: torch.Tensor) -> torch.Tensor:
+    """
+    Applies noise to target_x0 according to the DDPM forward process formula.
+    x_t = sqrt(alpha_bar_t) * x0 + sqrt(1-alpha_bar_t) * epsilon
+    :param target_x0: The clean data tensor.
+    :param epsilon: The noise tensor.
+    :param t: The current timestep.
+    :param alphas_cumprod: Tensor of cumulative products of alphas (should be on the same device as t is indexed on, usually CPU).
+    :return: The noised data tensor x_t.
+    """
+    sqrt_alpha_bar_t = torch.sqrt(alphas_cumprod[t])
+    sqrt_one_minus_alpha_bar_t = torch.sqrt(1.0 - alphas_cumprod[t])
+    
+    return sqrt_alpha_bar_t * target_x0 + sqrt_one_minus_alpha_bar_t * epsilon
+
+# --- Motion Processing Function ---
+def process_motion_file(file_path: str, num_expected_features: int) -> torch.Tensor:
+    """
+    Loads, preprocesses, and flattens a single .npy motion file.
+    This should return the clean x0.
+    :param file_path: Path to the .npy motion file.
+    :param num_expected_features: Expected number of features after flattening (e.g., joints * coords).
+    :return: Processed motion tensor x0 of shape (num_frames, num_motion_features).
+    """
+    try:
+        joints_data = np.load(file_path)  # Expected (T, num_joints, 3)
+    except Exception as e:
+        logger.error(f"Error loading motion file {file_path}: {e}")
+        raise
+    
+    # Example preprocessing: root centering
+    if joints_data.ndim == 3 and joints_data.shape[2] == 3: # Basic check for (T, J, 3)
+        joints_data = joints_data - joints_data[:, 0:1, :]  # Root centering
+        # joints_data = joints_data / 1000.0  # Example: Scale mm to m if your data is in mm
+                                           # Or apply other normalization (e.g., to [-1, 1])
+    else:
+        # Log a warning but proceed if possible, or raise an error if shape is critical
+        logger.warning(f"Unexpected data shape in {file_path}: {joints_data.shape}. Expected (T, J, 3). May affect preprocessing.")
+
+    num_frames = joints_data.shape[0]
+    try:
+        # Flatten: (T, num_joints, 3) -> (T, num_joints * 3)
+        processed_motion = joints_data.reshape(num_frames, -1)
+    except Exception as e:
+        logger.error(f"Error reshaping motion data from {file_path} (original shape: {joints_data.shape}): {e}")
+        raise
+
+    if processed_motion.shape[1] != num_expected_features:
+        raise ValueError(f"Feature mismatch in {file_path}: expected {num_expected_features} features, got {processed_motion.shape[1]}.")
+
+    return torch.from_numpy(processed_motion).float()
+
+
+class MyTextToMotionDataset(TextToMotionDataset):
+    """
+    Concrete Dataset for loading text, motion (as x0), and armature IDs.
+    Prepares data (x_noisy, target_x0, timesteps, conditions) for an x0-predicting diffusion model.
+    Inherits from the abstract TextToMotionDataset.
+    """
+    def __init__(self,
+                 root_dir: str, # Used as base for motion_dir and annotations_file if they are relative
+                 annotations_file_name: str, # e.g., "annotations.csv"
+                 motion_subdir: str,      # e.g., "motions_npy"
+                 num_diffusion_timesteps: int,
+                 alphas_cumprod: torch.Tensor, # Precomputed alphas_cumprod (should be on data_device)
+                 num_motion_features: int,
+                 motion_processor_fn: Callable = process_motion_file,
+                 min_seq_len: int = 10, # Minimum sequence length to accept
+                 max_seq_len: Optional[int] = None, # Optional: max sequence length for truncation/filtering
+                 timestep_sampler_fn: Callable = default_uniform_timestep_sampler,
+                 noise_fn: Callable = default_gaussian_noise_fn,
+                 noising_fn: Callable = default_ddpm_noising_fn,
+                 data_device: str = 'cpu'
+                ):
+        """
+        Initializes the dataset with paths, parameters, and customizable functions.
+        :param root_dir: Root directory containing the dataset.
+        :param annotations_file_name: Name of the CSV file with annotations (e.g., "annotations.csv").
+        :param motion_subdir: Subdirectory containing motion files (e.g., "motions_npy").
+        :param num_diffusion_timesteps: Total number of diffusion timesteps (T).
+        :param alphas_cumprod: Precomputed tensor of cumulative products of alphas (shape: (T,)).
+        :param num_motion_features: Number of features per frame in the motion data (e.g., joints * coords).
+        :param motion_processor_fn: Function to process motion files into tensors (default: process_motion_file).
+        :param min_seq_len: Minimum sequence length to accept (default: 10).
+        :param max_seq_len: Optional maximum sequence length for truncation (default: None, no truncation).
+        :param timestep_sampler_fn: Function to sample a random timestep (default: default_uniform_timestep_sampler).
+        :param noise_fn: Function to generate noise (default: default_gaussian_noise_fn).
+        :param noising_fn: Function to apply noise to the clean motion data (default: default_ddpm_noising_fn).
+        :param data_device: Device to use for data processing (default: 'cpu').
+        """
+        # Initialize paths
+        self.annotations_path = os.path.join(root_dir, annotations_file_name)
+        self.motion_dir_abs = os.path.join(root_dir, motion_subdir)
+        
+        # Store diffusion and processing parameters
+        self.num_diffusion_timesteps = num_diffusion_timesteps
+        self.data_device = torch.device(data_device)
+        self.alphas_cumprod = alphas_cumprod.to(self.data_device)
+        
+        self.motion_processor = motion_processor_fn
+        self.num_motion_features = num_motion_features
+        self.min_seq_len = min_seq_len
+        self.max_seq_len = max_seq_len
+        
+        # Store customizable functions
+        self.timestep_sampler = timestep_sampler_fn
+        self.noise_generator = noise_fn
+        self.apply_noise = noising_fn
+        
+        super().__init__(root_dir) 
+
+
+    def _prepare_samples(self):
+        """
+        Prepares the list of samples by reading the annotations file.
+        Each sample in self.samples will be a dictionary:
+        {'motion_file_path': str, 'text_prompt': str, 'armature_id': int}
+        This method is called by super().__init__.
+        """
+        self.samples = []
+        try:
+            annotations_df = pd.read_csv(self.annotations_path)
+        except FileNotFoundError:
+            logger.error(f"Annotations file not found: {self.annotations_path}")
+            raise
+        except Exception as e:
+            logger.error(f"Error reading annotations file {self.annotations_path}: {e}")
+            raise
+
+        for idx, row in annotations_df.iterrows():
+            motion_filename = row['motion_filename']
+            text_prompt = row['text']           
+            armature_id = row['armature_id']    
+
+            file_path = os.path.join(self.motion_dir_abs, motion_filename)
+            if not os.path.exists(file_path):
+                logger.warning(f"Motion file {file_path} for annotation '{motion_filename}' (row {idx}) not found. Skipping sample.")
+                continue
+            
+            # Store a dictionary with all necessary info for __getitem__
+            self.samples.append({
+                'motion_file_path': file_path,
+                'text_prompt': str(text_prompt),
+                'armature_id': int(armature_id)
+            })
+        
+        if not self.samples:
+            raise ValueError(f"No valid samples loaded. Check annotations file '{self.annotations_path}' and motion directory '{self.motion_dir_abs}'.")
+        logger.info(f"Prepared {len(self.samples)} samples from annotations.")
+
+    def _load_animation(self, motion_file_path: str) -> torch.Tensor:
+        """
+        Loads and processes a motion file to get the clean x0 tensor.
+        This overrides the abstract method.
+        The 'animation' parameter from the abstract class's __getitem__ is interpreted
+        as the motion_file_path here, passed from our concrete __getitem__.
+        Return value is adapted: returns processed x0 tensor (motion features).
+        :param motion_file_path: Path to the motion file (e.g., .npy).
+        :return: Processed motion tensor x0 of shape (num_frames, num_motion_features).
+        """
+        return self.motion_processor(motion_file_path, num_expected_features=self.num_motion_features)
+
+    def _load_text(self, text_prompt_string: str) -> str:
+        """
+        "Loads" text data by simply returning the provided string.
+        This overrides the abstract method.
+        The 'text' parameter from the abstract class's __getitem__ is interpreted
+        as the text_prompt_string here.
+        :param text_prompt_string: The text prompt string to be used as a condition.
+        :return: The text prompt string as is.
+        """
+        return text_prompt_string
+
+    def _load_action_descriptions(self) -> Dict[str, str]:
+        """
+        Loads action descriptions. Currently returns an empty dictionary.
+        This can be expanded if action descriptions (mapping action names to text) are needed.
+        ArmatureMDM currently uses armature_class_ids directly.
+        This method is called by super().__init__.
+        """
+        logger.info("Action descriptions are not actively loaded by this dataset version (using armature_class_id).")
+        return {} # Return empty dict as per abstract class if no specific loading is done
+
+    def __len__(self):
+        # This is implemented by the abstract TextToMotionDataset using self.samples
+        return super().__len__()
+
+    def __getitem__(self, idx: int) -> Optional[Dict[str, Any]]:
+        """
+        Fetches a single data sample, processes it for diffusion model training.
+        This method overrides the one in the abstract class to return a complete dictionary.
+        :param idx: Index of the sample to fetch.
+        :return: A dictionary containing:
+            - 'x_noisy': Noisy motion tensor (shape: (num_frames, num_motion_features))
+        """
+        # Simple retry logic: if a sample fails, try the next one.
+        # For robustness, pre-filtering in _prepare_samples is better.
+        for i in range(len(self.samples)): 
+            current_idx = (idx + i) % len(self.samples) # Wrap around
+            sample_info = self.samples[current_idx]
+            
+            try:
+                # 1. Load clean x0 motion data using the overridden _load_animation
+                # _load_animation uses self.motion_processor which should return a tensor
+                target_x0 = self._load_animation(sample_info['motion_file_path'])
+                target_x0 = target_x0.to(self.data_device) # Ensure it's on data_device
+
+                num_frames = target_x0.shape[0]
+
+                # 2. Filter by sequence length / truncate
+                if num_frames < self.min_seq_len:
+                    if i == len(self.samples) -1 : logger.debug(f"Last attempt for initial index {idx} failed min_seq_len check.")
+                    continue # Try next sample
+                
+                if self.max_seq_len is not None and num_frames > self.max_seq_len:
+                    target_x0 = target_x0[:self.max_seq_len] # Truncate (example: from start)
+                    num_frames = self.max_seq_len
+                
+                # 3. "Load" text condition (already a string from sample_info)
+                text_condition = self._load_text(sample_info['text_prompt'])
+                
+                # 4. Get armature ID
+                armature_id = sample_info['armature_id']
+
+                # 5. Sample a random timestep t using the customizable sampler
+                t = self.timestep_sampler(self.num_diffusion_timesteps)
+
+                # 6. Generate noise epsilon using the customizable noise generator
+                epsilon = self.noise_generator(target_x0.shape, device=self.data_device)
+
+                # 7. Calculate x_t (noisy motion) using the customizable noising function
+                x_noisy = self.apply_noise(target_x0, epsilon, t, self.alphas_cumprod)
+                
+                return {
+                    "x_noisy": x_noisy.float(),
+                    "target_x0": target_x0.float(),
+                    "timesteps": torch.tensor(t, dtype=torch.long, device=self.data_device),
+                    "text_conditions": text_condition, # Kept as string for SBERT in model
+                    "armature_class_ids": torch.tensor(armature_id, dtype=torch.long, device=self.data_device),
+                    "seq_len": torch.tensor(num_frames, dtype=torch.long, device=self.data_device) # For padding mask by collate_fn
+                }
+            except Exception as e:
+                logger.warning(f"Error processing sample for motion '{sample_info.get('motion_file_path', 'N/A')}' (idx_map {idx}, attempt {i}, actual_idx {current_idx}): {e}. Trying next.")
+                if i == len(self.samples) -1: # If this was the last attempt
+                    logger.error(f"All attempts failed for initial index {idx}. Could not fetch a valid sample.")
+                    return None # Indicate failure to collate_fn
+        
+        return None # Should not be reached if self.samples is not empty
+
