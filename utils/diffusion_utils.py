@@ -1,6 +1,7 @@
+import json
 import logging
 import os
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -37,6 +38,22 @@ def setup_logging(log_dir: str, run_name: str) -> None:
     root_logger.addHandler(file_handler)
     root_logger.addHandler(console_handler)
     logger.info(f"Logging setup complete. Log file: {log_file_path}")
+
+
+def load_armature_config(config_path: str) -> dict:
+    """Loads the armature configuration from a JSON file."""
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            config = json.load(f)
+        logger.info(f"Successfully loaded armature configuration from: {config_path}")
+        return config
+    except FileNotFoundError:
+        logger.error(f"Armature configuration file not found: {config_path}. Using default full mask.")
+    except json.JSONDecodeError:
+        logger.error(f"Error decoding JSON from armature configuration file: {config_path}. Using default full mask.")
+    except Exception as e:
+        logger.error(f"An unexpected error occurred loading armature config {config_path}: {e}. Using default full mask.")
+    return None
 
 
 def get_noise_schedule(num_diffusion_timesteps: int,
@@ -123,7 +140,10 @@ def plot_training_history(history: Dict[str, List[float]],
 def get_bone_mask_for_armature(armature_class_ids: torch.Tensor,
                                num_total_motion_features: int,
                                num_frames: int,
-                               device: str) -> torch.Tensor:
+                               device: str,
+                               armature_config_data: Optional[Dict] = None,
+                               features_per_bone_override: Optional[int] = None
+                            ) -> torch.Tensor:
     """
     Generates a bone mask based on armature class IDs.
     This is a placeholder and needs to be implemented or adapted
@@ -134,26 +154,66 @@ def get_bone_mask_for_armature(armature_class_ids: torch.Tensor,
     :param num_total_motion_features: Total number of features in the motion data (e.g., joints * coords).
     :param num_frames: Number of frames in the motion sequence.
     :param device: Device to create the mask tensor on (e.g., 'cuda', 'cpu').
+    :param armature_config_data: Optional dictionary containing armature configuration data.
+    :param features_per_bone_override: Optional override for number of features per bone.
     :return: Bone mask tensor of shape (batch_size, num_frames, num_total_motion_features),
              with 1s for active features and 0s for inactive ones.
     """
     batch_size = armature_class_ids.shape[0]
-    
-    # Placeholder logic: Assumes a single, default armature where all features are active.
-    # TODO: Implement actual logic based on different armature_class_ids if you have multiple
-    #       armature types with different active joints/features.
-    #       For example:
-    #       mask = torch.zeros((batch_size, num_frames, num_total_motion_features), device=device, dtype=torch.float32)
-    #       for i in range(batch_size):
-    #           if armature_class_ids[i].item() == ARMATURE_TYPE_A_ID:
-    #               mask[i, :, indices_for_armature_A] = 1.0
-    #           elif armature_class_ids[i].item() == ARMATURE_TYPE_B_ID:
-    #               mask[i, :, indices_for_armature_B] = 1.0
-    #       return mask
-    
-    # Current placeholder returns all ones (all features active for all samples)
-    mask = torch.ones((batch_size, num_frames, num_total_motion_features), device=device, dtype=torch.float32)
-    logger.debug(f"Generated bone mask for {batch_size} samples. Current logic activates all features.")
+    mask = torch.zeros((batch_size, num_frames, num_total_motion_features), device=device, dtype=torch.float32)
+
+    if armature_config_data is None:
+        logger.warning("Armature config data not provided to get_bone_mask_for_armature. Defaulting to activate all features.")
+        mask.fill_(1.0)
+        return mask
+
+    features_per_bone = features_per_bone_override if features_per_bone_override is not None else armature_config_data.get("FEATURES_PER_BONE", 3)
+    armature_definitions = armature_config_data.get("ARMATURE_DEFINITIONS", {})
+    default_num_bones = armature_config_data.get("DEFAULT_FALLBACK_NUM_ACTIVE_BONES") # Can be None
+
+    if num_total_motion_features % features_per_bone != 0:
+        logger.error(f"num_total_motion_features ({num_total_motion_features}) is not divisible by "
+                       f"FEATURES_PER_BONE ({features_per_bone}). Masking logic might be incorrect. Activating all features.")
+        mask.fill_(1.0)
+        return mask
+
+    for i in range(batch_size):
+        current_armature_id_int = armature_class_ids[i].item()
+        current_armature_id_str = str(current_armature_id_int) # JSON keys are strings
+
+        num_active_bones = None
+        if current_armature_id_str in armature_definitions:
+            num_active_bones = armature_definitions[current_armature_id_str].get("num_active_bones")
+        
+        if num_active_bones is None: # ID not found or 'num_active_bones' key missing
+            if default_num_bones is not None:
+                num_active_bones = default_num_bones
+                logger.warning(f"Sample {i}: Armature ID {current_armature_id_int} not in ARMATURE_DEFINITIONS "
+                               f"or 'num_active_bones' missing. Using default fallback of {default_num_bones} bones.")
+            else:
+                logger.warning(f"Sample {i}: Armature ID {current_armature_id_int} not in ARMATURE_DEFINITIONS "
+                               f"and no default fallback. Activating all features for this sample.")
+                mask[i, :, :] = 1.0
+                continue # Move to next sample in batch
+
+        num_active_features = num_active_bones * features_per_bone
+
+        if num_active_features > num_total_motion_features:
+            logger.warning(f"Sample {i}: For armature ID {current_armature_id_int}, calculated num_active_features "
+                           f"({num_active_features}) exceeds num_total_motion_features ({num_total_motion_features}). "
+                           f"Clamping to num_total_motion_features.")
+            num_active_features = num_total_motion_features
+        elif num_active_features < 0:
+            logger.warning(f"Sample {i}: For armature ID {current_armature_id_int}, calculated num_active_features "
+                           f"is negative ({num_active_features}). Setting to 0.")
+            num_active_features = 0
+        
+        if num_active_features > 0:
+            mask[i, :, :num_active_features] = 1.0
+        
+        logger.debug(f"Sample {i}: Armature ID {current_armature_id_int} - Activating first {num_active_features} features "
+                     f"(for {num_active_bones} bones).")
+            
     return mask
 
 def default_uniform_timestep_sampler(num_diffusion_timesteps: int) -> int:
