@@ -1,0 +1,18 @@
+{
+  "FEATURES_PER_BONE": 3,
+  "ARMATURE_DEFINITIONS": {
+    "1": {
+      "name": "Full_Biped_22_Joints",
+      "num_active_bones": 22 
+    },
+    "2": {
+      "name": "Upper_Body_Plus_Root",
+      "num_active_bones": 15 
+    },
+    "3": {
+      "name": "Simple_Stick_5_Bones",
+      "num_active_bones": 5
+    }
+  },
+  "DEFAULT_FALLBACK_NUM_ACTIVE_BONES": 22 
+}

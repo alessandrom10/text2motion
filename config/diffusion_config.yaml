@@ -2,6 +2,7 @@ run_name: "diffusion_experiment_01"
 
 paths:
   data_root_dir: "C:/PythonProjects/text2motion/data/"
+  armature_config_file: "config/armature_config.json"
   annotations_file_name: "annotations_train.csv"
   val_annotations_file_name: "annotations_val.csv"
   motion_subdir: "new_joints"
@@ -27,24 +28,47 @@ model_hyperparameters:
   text_time_cond_policy: "add"
   armature_integration_policy: "add"
   timestep_embedder_type: "mlp"
+  # Parameters for ArmatureMDM's conditioning and structure
+  text_cond_dropout_prob: 0.1
+  armature_cond_dropout_prob: 0.1
+  max_seq_len_pos_enc: 5000 # Renamed from 'max_seq_len' for clarity if used for PositionalEncoding
+  use_final_algebraic_refinement_encoder: true
+  algebraic_refinement_hidden_dim: null # Or an integer value like 768
+  timestep_gru_num_layers: 1
+  timestep_gru_dropout: 0.0
+  # Parameters for MDMGeometricLosses related to motion data structure
+  num_joints_for_geom: 22    # Total number of joints in your representation
+  features_per_joint_for_geom: 3 # e.g., 3 for XYZ coordinates
+
 
 training_hyperparameters:
-  batch_size: 64
-  num_epochs: 1
-  learning_rate: 0.0001
+  batch_size: 32
+  num_epochs: 50
+  learning_rate: 0.001
   cfg_drop_prob_trainer: 0.1
   device: "cuda"
   use_lr_scheduler: true
+  lr_scheduler_factor: 0.5
+  main_loss_type_trainer: "mse"
+
 
 early_stopping:
   early_stopping_patience: 10
   early_stopping_min_delta: 0.0001
-
+      
 kinematic_losses:
   use_kinematic_losses: false
   velocity_loss_weight: 0.0
   acceleration_loss_weight: 0.0
   kinematic_loss_type: "l1"
+
+# Geometric Losses
+mdm_geometric_losses:
+  use_mdm_geometric_losses: false # Set to true to enable these losses
+  lambda_pos: 0.0     # Weight for position loss (L_pos). 
+  lambda_vel: 0.0     # Weight for velocity loss (L_vel). Set > 0 to use.
+  lambda_foot: 0.0    # Weight for foot contact loss (L_foot). Set > 0 to use.
+  foot_joint_indices: [10, 11] # Example: Indices for Left Foot and Right Foot
 
 dataset_parameters:
   min_seq_len_dataset: 20
