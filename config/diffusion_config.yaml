@@ -7,9 +7,11 @@ paths:
   motion_subdir: "new_joints"
   model_save_dir: "./trained_models_final/"
   model_filename: "armature_mdm_final.pth"
+  precomputed_sbert_train_path: "./data/sbert_embeddings_train.pt"
+  precomputed_sbert_val_path: "./data/sbert_embeddings_val.pt"
 
 diffusion_hyperparameters:
-  num_diffusion_timesteps: 1000
+  num_diffusion_timesteps: 50
 
 model_hyperparameters:
   num_motion_features: 66
@@ -19,6 +21,7 @@ model_hyperparameters:
   num_heads: 4
   dropout: 0.1
   sbert_model_name: 'all-mpnet-base-v2'
+  sbert_embedding_dim: 768
   max_armature_classes: 10
   armature_embedding_dim: 64
   text_time_cond_policy: "add"
@@ -26,8 +29,8 @@ model_hyperparameters:
   timestep_embedder_type: "mlp"
 
 training_hyperparameters:
-  batch_size: 32
-  num_epochs: 50
+  batch_size: 64
+  num_epochs: 1
   learning_rate: 0.0001
   cfg_drop_prob_trainer: 0.1
   device: "cuda"

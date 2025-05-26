@@ -3,6 +3,7 @@ import logging
 import os
 import sys
 from pathlib import Path
+from sklearn.model_selection import train_test_split
 import yaml
 from typing import Any, Dict, List
 import torch
@@ -27,77 +28,97 @@ from utils.diffusion_utils import (
     setup_logging,
     get_noise_schedule,
     plot_training_history,
-    get_bone_mask_for_armature
+    get_bone_mask_for_armature,
+    generate_and_save_sbert_embeddings
 )
 
 logger = logging.getLogger(__name__) # Gets a logger named after the current module
 
-def generate_annotation_file(
+def scan_and_pair_all_available_samples(
     data_root: str,
     motion_subdir_name: str,
     text_subdir_name: str,
-    output_csv_filename: str,
-    default_armature_id: int = 1
-) -> None:
+    default_armature_id: int
+) -> List[Dict[str, Any]]:
     """
-    Scans motion and text directories, pairs them, and creates a CSV annotation file.
-
-    :param data_root: Root directory where 'motion_subdir' and 'text_subdir' are located.
-    :param motion_subdir_name: Subdirectory containing .npy motion files.
-    :param text_subdir_name: Subdirectory containing .txt text files.
-    :param output_csv_filename: Name of the CSV file to create (e.g., "annotations.csv").
-                                This path will be relative to 'data_root'.
-    :param default_armature_id: The armature ID to assign to all samples.
+    Scans motion and text directories to find all valid, paired samples.
+    Returns a list of dictionaries, each containing 'motion_filename' (base name), 
+    'text', and 'armature_id'.
+    :param data_root: Base directory where motion and text subdirs are located.
+    :param motion_subdir_name: Name of the subdirectory containing motion files.
+    :param text_subdir_name: Name of the subdirectory containing text files.
+    :param default_armature_id: Default armature ID to use for all samples.
+    :return: List of dictionaries with paired sample information.
     """
-    logger.info(f"Starting annotation file generation: {output_csv_filename}")
-    motion_dir_abs = os.path.join(data_root, motion_subdir_name)
-    text_dir_abs = os.path.join(data_root, text_subdir_name)
-    output_csv_path = os.path.join(data_root, output_csv_filename)
+    logger.info(f"Scanning for all available samples: Motion subdir='{motion_subdir_name}', Text subdir='{text_subdir_name}' in '{data_root}'")
+    all_paired_samples_info = []
+    motion_dir_abs_path = os.path.join(data_root, motion_subdir_name)
+    text_dir_abs_path = os.path.join(data_root, text_subdir_name)
 
-    if not os.path.isdir(motion_dir_abs):
-        logger.error(f"Motion directory not found: {motion_dir_abs}")
-        return
-    if not os.path.isdir(text_dir_abs):
-        logger.error(f"Text directory not found: {text_dir_abs}")
-        return
+    if not os.path.isdir(motion_dir_abs_path):
+        logger.error(f"Motion directory not found: {motion_dir_abs_path}"); return []
+    if not os.path.isdir(text_dir_abs_path):
+        logger.error(f"Text directory not found: {text_dir_abs_path}"); return []
 
-    paired_samples_data = []
-    motion_files = sorted([f for f in os.listdir(motion_dir_abs) if f.endswith(".npy")]) 
-    logger.info(f"Found {len(motion_files)} .npy files in '{motion_dir_abs}'.")
+    # Expecting .npy files as per your data structure
+    motion_filenames_with_ext = sorted([f for f in os.listdir(motion_dir_abs_path) if f.endswith(".npy")])
+    logger.info(f"Found {len(motion_filenames_with_ext)} total .npy files in '{motion_dir_abs_path}'.")
 
-    for motion_filename in motion_files:
-        base_name = os.path.splitext(motion_filename)[0]
-        text_file_name = base_name + ".txt"
-        text_file_path_abs = os.path.join(text_dir_abs, text_file_name)
+    for motion_filename_ext in motion_filenames_with_ext:
+        base_name = os.path.splitext(motion_filename_ext)[0]
+        text_file_name_ext = base_name + ".txt"
+        text_file_path_abs = os.path.join(text_dir_abs_path, text_file_name_ext)
         
         if os.path.exists(text_file_path_abs):
             try:
                 with open(text_file_path_abs, 'r', encoding='utf-8') as f:
                     text_prompt = f.read().strip()
                 if text_prompt:
-                    paired_samples_data.append({
-                        'motion_filename': motion_filename,
+                    all_paired_samples_info.append({
+                        'motion_filename': motion_filename_ext,
                         'text': text_prompt,
                         'armature_id': default_armature_id
                     })
                 else:
-                    logger.warning(f"Empty text file: {text_file_path_abs} for motion {motion_filename}. Skipping.")
+                    logger.warning(f"Empty text file: {text_file_path_abs} for motion {motion_filename_ext}. Skipping.")
             except Exception as e:
                 logger.warning(f"Could not read text file {text_file_path_abs}: {e}. Skipping.")
         else:
-            logger.warning(f"Matching text file not found for {motion_filename} at {text_file_path_abs}. Skipping.")
+            logger.warning(f"Matching text file not found for {motion_filename_ext} at {text_file_path_abs}. Skipping.")
+    
+    logger.info(f"Successfully found {len(all_paired_samples_info)} paired motion/text samples.")
+    return all_paired_samples_info
 
-    if not paired_samples_data:
-        logger.warning(f"No paired samples found to write to {output_csv_path}.")
+# --- Generate Annotation File from a LIST of samples ---
+def generate_annotation_file_from_sample_list(
+    samples_list: List[Dict[str, Any]],
+    data_root: str,
+    output_csv_filename: str 
+) -> None:
+    """
+    Creates a CSV annotation file from a provided list of sample dictionaries.
+    The 'motion_filename' in the sample_list should be the filename (e.g., "000000.npy").
+    The output CSV will be saved in data_root/output_csv_filename.
+    :param samples_list: List of dictionaries, each with 'motion_filename', 'text', and 'armature_id'.
+    :param data_root: Base directory where the output CSV will be saved.
+    :param output_csv_filename: Name of the output CSV file (e.g., "annotations_train.csv").
+    :return: None
+    """
+    if not samples_list:
+        logger.warning(f"No samples provided to write to '{output_csv_filename}'. Skipping file generation.")
         return
 
+    output_csv_full_path = os.path.join(data_root, output_csv_filename)
+    logger.info(f"Generating annotation file: {output_csv_full_path} with {len(samples_list)} samples.")
+
     try:
-        df = pd.DataFrame(paired_samples_data)
-        os.makedirs(os.path.dirname(output_csv_path), exist_ok=True) # Ensure directory exists
-        df.to_csv(output_csv_path, index=False)
-        logger.info(f"Successfully created annotation file with {len(df)} entries: {output_csv_path}")
+        df = pd.DataFrame(samples_list)
+        # Ensure the directory for the output CSV exists
+        os.makedirs(os.path.dirname(output_csv_full_path), exist_ok=True)
+        df.to_csv(output_csv_full_path, index=False)
+        logger.info(f"Successfully created annotation file: {output_csv_full_path}")
     except Exception as e:
-        logger.error(f"Failed to write annotation file {output_csv_path}: {e}", exc_info=True)
+        logger.error(f"Failed to write annotation file {output_csv_full_path}: {e}", exc_info=True)
 
 
 # --- Main Training Orchestration Function ---
@@ -131,13 +152,50 @@ def run_training_pipeline(config: Dict[str, Any]) -> None:
         device=alphas_cumprod_device
     )
 
-    # 2. Create Datasets and DataLoaders
+    # 2. Precomputed SBERT Embeddings
+    sbert_train_emb_path = os.path.join(paths_config.get('data_root_dir', './data/'), 
+                                        paths_config.get('precomputed_sbert_train_filename', 'sbert_embeddings_train.pt'))
+
+    if not os.path.exists(sbert_train_emb_path):
+        logger.info(f"Precomputed SBERT embeddings for train not found at {sbert_train_emb_path}.")
+        # Call the function to generate SBERT embeddings
+        logger.info("Generating SBERT embeddings for training data...")
+        generate_and_save_sbert_embeddings(
+            annotations_csv_path=os.path.join(paths_config['data_root_dir'], paths_config['annotations_file_name']),
+            sbert_model_name=model_hparams['sbert_model_name'],
+            output_embeddings_path=sbert_train_emb_path,
+            device=str(device)
+        )
+        if not os.path.exists(sbert_train_emb_path):
+            logger.error("Failed to generate or find precomputed SBERT train embeddings. Aborting.")
+            return
+    
+    sbert_val_emb_path = None
+    if paths_config.get('val_annotations_file_name'):
+        sbert_val_emb_path = os.path.join(paths_config.get('data_root_dir', './data/'),
+                                          paths_config.get('precomputed_sbert_val_filename', 'sbert_embeddings_val.pt'))
+        if not os.path.exists(sbert_val_emb_path):
+            logger.info(f"Precomputed SBERT embeddings for validation not found at {sbert_val_emb_path}.")
+            # Call the function to generate SBERT embeddings for validation
+            logger.info("Generating SBERT embeddings for validation data...")
+            generate_and_save_sbert_embeddings(
+                annotations_csv_path=os.path.join(paths_config['data_root_dir'], paths_config['val_annotations_file_name']),
+                sbert_model_name=model_hparams['sbert_model_name'],
+                output_embeddings_path=sbert_val_emb_path,
+                device=str(device)
+            )
+            if not os.path.exists(sbert_val_emb_path):
+                logger.error("Failed to generate or find precomputed SBERT validation embeddings. Aborting.")
+                return
+            
+    # 3. Create Datasets and DataLoaders
     logger.info("Loading training data...")
     try:
         train_dataset = MyTextToMotionDataset(
             root_dir=paths_config.get('data_root_dir', './data/'),
             annotations_file_name=paths_config.get('annotations_file_name', 'annotations_train.csv'),
             motion_subdir=paths_config.get('motion_subdir', 'new_joints'),
+            precomputed_sbert_embeddings_path=sbert_train_emb_path,
             num_diffusion_timesteps=diffusion_params.get('num_diffusion_timesteps', 1000),
             alphas_cumprod=alphas_cumprod,
             num_motion_features=model_hparams.get('num_motion_features', 66),
@@ -166,6 +224,7 @@ def run_training_pipeline(config: Dict[str, Any]) -> None:
                 root_dir=paths_config.get('data_root_dir', './data/'),
                 annotations_file_name=paths_config['val_annotations_file_name'],
                 motion_subdir=paths_config.get('motion_subdir', 'new_joints'),
+                precomputed_sbert_embeddings_path=sbert_val_emb_path,
                 num_diffusion_timesteps=diffusion_params.get('num_diffusion_timesteps', 1000),
                 alphas_cumprod=alphas_cumprod,
                 num_motion_features=model_hparams.get('num_motion_features', 66),
@@ -185,7 +244,7 @@ def run_training_pipeline(config: Dict[str, Any]) -> None:
             logger.warning(f"Failed to create validation dataset: {e}. Proceeding without validation.", exc_info=True)
     else: logger.info("No 'val_annotations_file_name' in config. Proceeding without validation.")
 
-    # 3. Setup Model, Optimizer, Scheduler (as in your script)
+    # 4. Setup Model, Optimizer, Scheduler (as in your script)
     model = ArmatureMDM(
         num_motion_features=model_hparams.get('num_motion_features', 66),
         latent_dim=model_hparams.get('latent_dim', 768),
@@ -222,7 +281,7 @@ def run_training_pipeline(config: Dict[str, Any]) -> None:
         )
     logger.info(f"Model initialized. Parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
-    # 4. Setup Kinematic Loss Calculator (as in your script)
+    # 5. Setup Kinematic Loss Calculator (as in your script)
     kinematic_calculator = None
     kinematic_params = config.get('kinematic_losses', {}) 
     if kinematic_params.get('use_kinematic_losses', False):
@@ -239,7 +298,7 @@ def run_training_pipeline(config: Dict[str, Any]) -> None:
             )
     logger.info(f"Kinematic losses {'ENABLED' if kinematic_calculator else 'DISABLED'}")
 
-    # 5. Initialize Trainer (as in your script)
+    # 6. Initialize Trainer (as in your script)
     trainer = ArmatureMDMTrainer(
         model=model, optimizer=optimizer, get_bone_mask_fn=get_bone_mask_for_armature,
         device=str(device), lr_scheduler=lr_scheduler,
@@ -251,7 +310,7 @@ def run_training_pipeline(config: Dict[str, Any]) -> None:
         model_save_path=os.path.join(model_save_dir, paths_config.get('model_filename', 'model.pth'))
     )
 
-    # 6. Start Training
+    # 7. Start Training
     num_epochs_to_run = training_hparams.get('num_epochs', 50)
     logger.info(f"Attempting to start training for {num_epochs_to_run} epochs...")
     
@@ -264,7 +323,7 @@ def run_training_pipeline(config: Dict[str, Any]) -> None:
     completed_epochs = trainer.completed_epochs_count if hasattr(trainer, 'completed_epochs_count') else num_epochs_to_run
     logger.info(f"======= Training Run Finished ({completed_epochs} epochs completed) =======")
 
-    # 7. Plotting results
+    # 8. Plotting results
     if history:
         plot_training_history( # From your utils
             history,
@@ -314,48 +373,95 @@ def main_entry_point():
         default=1,
         help='Default armature ID to use when generating annotations.'
     )
+    parser.add_argument(
+        '--val_split_ratio', type=float, default=0.2, # Added for 80/20 split
+        help='Ratio of data to use for the validation set (e.g., 0.2 for 20%).'
+    )
     args = parser.parse_args()
 
     try:
         config = load_config_from_yaml(args.config)
-        if not config: 
-            logger.error("Failed to load a valid configuration. Exiting.")
-            return
+        if not config: logger.error("Failed to load configuration. Exiting."); return
 
-        paths_config = config.get('paths', {})
-        data_root = paths_config.get('data_root_dir', './data/')
+        paths_cfg = config.get('paths', {})
+        data_root_cfg = paths_cfg.get('data_root_dir', './data/') # Fallback if not in config
 
         if args.generate_annotations:
             logger.info("Annotation generation mode selected.")
-            # Generate for training set
-            train_ann_filename = paths_config.get('annotations_file_name')
-            if train_ann_filename:
-                generate_annotation_file(
-                    data_root=data_root,
-                    motion_subdir_name=paths_config.get('motion_subdir', 'new_joints'),
-                    text_subdir_name=config.get('text_subdir_name_for_generation', 'texts'), # New config key or hardcode
-                    output_csv_filename=train_ann_filename,
-                    default_armature_id=args.default_armature_id
-                )
-            else:
-                logger.warning("Config 'paths.annotations_file_name' not specified. Skipping training annotation generation.")
+            
+            # 1. Scan all available data first
+            all_samples = scan_and_pair_all_available_samples(
+                data_root=data_root_cfg,
+                motion_subdir_name=paths_cfg.get('motion_subdir', 'new_joints'), # Use config, fallback
+                text_subdir_name=config.get('text_subdir_name_for_prep', 'texts'), # Use config, fallback
+                default_armature_id=args.default_armature_id
+            )
 
-            val_ann_filename = paths_config.get('val_annotations_file_name')
-            if val_ann_filename:
-                generate_annotation_file(
-                    data_root=data_root,
-                    motion_subdir_name=paths_config.get('motion_subdir_val', paths_config.get('motion_subdir', 'new_joints')), # Allow specific val motion_subdir
-                    text_subdir_name=config.get('text_subdir_name_for_generation_val', config.get('text_subdir_name_for_generation', 'texts')), # Allow specific val text_subdir
-                    output_csv_filename=val_ann_filename,
-                    default_armature_id=args.default_armature_id
+            if not all_samples:
+                logger.error("No samples found to generate annotations. Exiting.")
+                return
+
+            # 2. Split the list of all samples into training and validation sets
+            if args.val_split_ratio > 0 and args.val_split_ratio < 1:
+                train_samples_list, val_samples_list = train_test_split(
+                    all_samples, 
+                    test_size=args.val_split_ratio, 
+                    random_state=42,
+                    shuffle=True
                 )
-            else:
+                logger.info(f"Split all {len(all_samples)} samples into {len(train_samples_list)} train and {len(val_samples_list)} validation samples.")
+            else: # No validation split or invalid ratio
+                train_samples_list = all_samples
+                val_samples_list = []
+                logger.info(f"Using all {len(all_samples)} samples for training. No validation set will be generated from split.")
+
+            # 3. Generate annotation file for the training set
+            train_ann_filename = paths_cfg.get('annotations_file_name')
+            if train_ann_filename and train_samples_list:
+                generate_annotation_file_from_sample_list(
+                    samples_list=train_samples_list,
+                    data_root=data_root_cfg,
+                    output_csv_filename=train_ann_filename
+                )
+            elif not train_ann_filename:
+                logger.warning("Config 'paths.annotations_file_name' not specified. Skipping training annotation generation.")
+            elif not train_samples_list:
+                logger.warning("Training sample list is empty after split. Skipping training annotation generation.")
+
+
+            # 4. Generate annotation file for the validation set
+            val_ann_filename = paths_cfg.get('val_annotations_file_name')
+            if val_ann_filename and val_samples_list:
+                generate_annotation_file_from_sample_list(
+                    samples_list=val_samples_list,
+                    data_root=data_root_cfg, # Output CSV will be in data_root_cfg
+                    output_csv_filename=val_ann_filename
+                )
+            elif not val_ann_filename:
                 logger.info("Config 'paths.val_annotations_file_name' not specified. Skipping validation annotation generation.")
+            elif not val_samples_list:
+                logger.info("Validation sample list is empty. Skipping validation annotation generation.")
             
             logger.info("Annotation generation process finished.")
 
-        else:
+        else: # If not generating annotations, proceed to training
             logger.info("Training mode selected.")
+            # Ensure annotation files exist before trying to train
+            train_ann_full_path = os.path.join(data_root_cfg, paths_cfg.get('annotations_file_name', ''))
+            if not os.path.exists(train_ann_full_path):
+                logger.error(f"Training annotation file not found: {train_ann_full_path}. "
+                             "Please generate annotations first using the --generate_annotations flag.")
+                return
+            
+            val_ann_filename_cfg = paths_cfg.get('val_annotations_file_name')
+            if val_ann_filename_cfg: # If a validation file is configured
+                val_ann_full_path = os.path.join(data_root_cfg, val_ann_filename_cfg)
+                if not os.path.exists(val_ann_full_path):
+                    logger.warning(f"Validation annotation file '{val_ann_full_path}' configured but not found. "
+                                   "Proceeding without validation or generate it first.")
+                    # Optionally, you could force run_training_pipeline to not use val_loader
+                    # by modifying the config dict passed to it, or handle in run_training_pipeline
+            
             run_training_pipeline(config)
 
     except FileNotFoundError:

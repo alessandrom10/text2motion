@@ -36,19 +36,18 @@ def collate_motion_data(batch: List[Optional[Dict[str, Any]]]) -> Dict[str, Any]
     first_item_keys = valid_batch_items[0].keys()
 
     for key in first_item_keys:
-        if key == "text_conditions":
+        if key == "text_conditions": 
+            logger.warning("Collating 'text_conditions' (list of strings), expected 'text_embeddings' (tensor).")
             collated_batch[key] = [item[key] for item in valid_batch_items]
         elif torch.is_tensor(valid_batch_items[0][key]):
             if key in ["x_noisy", "target_x0"]:
                 sequences = [item[key] for item in valid_batch_items]
                 collated_batch[key] = pad_sequence(sequences, batch_first=True, padding_value=0.0)
+            elif key == "text_embeddings":
+                # Assuming text_embeddings are already tensors
+                collated_batch[key] = torch.stack([item[key] for item in valid_batch_items])
             else:
-                try:
-                    collated_batch[key] = torch.stack([item[key] for item in valid_batch_items])
-                except Exception as e:
-                    logger.error(f"Error stacking tensor for key '{key}': {e}. "
-                                 f"Item shapes: {[item[key].shape for item in valid_batch_items if key in item]}", exc_info=True)
-                    raise
+                collated_batch[key] = torch.stack([item[key] for item in valid_batch_items])
 
     if "seq_len" in collated_batch and ("x_noisy" in collated_batch or "target_x0" in collated_batch):
         padded_sequence_key = "x_noisy" if "x_noisy" in collated_batch else "target_x0"
@@ -122,6 +121,7 @@ class MyTextToMotionDataset(TextToMotionDataset):
                  root_dir: str, # Used as base for motion_dir and annotations_file if they are relative
                  annotations_file_name: str, # e.g., "annotations.csv"
                  motion_subdir: str,      # e.g., "motions_npy"
+                 precomputed_sbert_embeddings_path: str, # Path to precomputed SBERT embeddings
                  num_diffusion_timesteps: int,
                  alphas_cumprod: torch.Tensor, # Precomputed alphas_cumprod (should be on data_device)
                  num_motion_features: int,
@@ -138,6 +138,7 @@ class MyTextToMotionDataset(TextToMotionDataset):
         :param root_dir: Root directory containing the dataset.
         :param annotations_file_name: Name of the CSV file with annotations (e.g., "annotations.csv").
         :param motion_subdir: Subdirectory containing motion files (e.g., "motions_npy").
+        :param precomputed_sbert_embeddings_path: Path to precomputed SBERT embeddings for text conditions.
         :param num_diffusion_timesteps: Total number of diffusion timesteps (T).
         :param alphas_cumprod: Precomputed tensor of cumulative products of alphas (shape: (T,)).
         :param num_motion_features: Number of features per frame in the motion data (e.g., joints * coords).
@@ -168,6 +169,18 @@ class MyTextToMotionDataset(TextToMotionDataset):
         self.noise_generator = noise_fn
         self.apply_noise = noising_fn
         
+        try:
+            logger.info(f"Loading pre-computed SBERT embeddings from: {precomputed_sbert_embeddings_path}")
+            self.sbert_embeddings_cache = torch.load(precomputed_sbert_embeddings_path, map_location=self.data_device)
+            logger.info(f"Loaded {len(self.sbert_embeddings_cache)} pre-computed SBERT embeddings.")
+        except FileNotFoundError:
+            logger.error(f"Pre-computed SBERT embeddings file not found: {precomputed_sbert_embeddings_path}. "
+                         "Please generate it first.")
+            raise
+        except Exception as e:
+            logger.error(f"Error loading pre-computed SBERT embeddings from {precomputed_sbert_embeddings_path}: {e}")
+            raise
+
         super().__init__(root_dir) 
 
 
@@ -283,6 +296,13 @@ class MyTextToMotionDataset(TextToMotionDataset):
                 # 4. Get armature ID
                 armature_id = sample_info['armature_id']
 
+                if text_condition not in self.sbert_embeddings_cache:
+                    logger.warning(f"Pre-computed SBERT embedding not found for text: '{text_condition[:50]}...'. Skipping sample.")
+                    if i == len(self.samples) -1: return None
+                    continue
+                
+                sbert_embedding = self.sbert_embeddings_cache[text_condition].to(self.data_device)
+
                 # 5. Sample a random timestep t using the customizable sampler
                 t = self.timestep_sampler(self.num_diffusion_timesteps)
 
@@ -296,7 +316,7 @@ class MyTextToMotionDataset(TextToMotionDataset):
                     "x_noisy": x_noisy.float(),
                     "target_x0": target_x0.float(),
                     "timesteps": torch.tensor(t, dtype=torch.long, device=self.data_device),
-                    "text_conditions": text_condition, # Kept as string for SBERT in model
+                    "text_embeddings": sbert_embedding.float(),
                     "armature_class_ids": torch.tensor(armature_id, dtype=torch.long, device=self.data_device),
                     "seq_len": torch.tensor(num_frames, dtype=torch.long, device=self.data_device) # For padding mask by collate_fn
                 }

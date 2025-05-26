@@ -148,6 +148,7 @@ class ArmatureMDM(nn.Module):
                     dropout: float = 0.1, # General dropout
                     activation: str = "gelu", # For Transformer backbone
                     sbert_model_name: str = 'all-mpnet-base-v2',
+                    sbert_embedding_dim: Optional[int] = 768, # Default SBERT output dimension
                     max_armature_classes: int = 10,
                     armature_embedding_dim: int = 64, # Raw dimension for armature class ID
                     text_cond_dropout_prob: float = 0.1,
@@ -174,6 +175,7 @@ class ArmatureMDM(nn.Module):
         :param dropout: General dropout for the backbone and positional encoding.
         :param activation: Activation function for Transformer layers (e.g., "gelu").
         :param sbert_model_name: Name of the Sentence-BERT model for text conditioning.
+        :param sbert_embedding_dim: Dimension of the Sentence-BERT output embedding. If None, uses default from model.
         :param max_armature_classes: Maximum number of armature classes for the nn.Embedding layer.
         :param armature_embedding_dim: Dimension of the raw armature class embedding from nn.Embedding.
         :param text_cond_dropout_prob: Dropout probability for text conditioning (for CFG).
@@ -218,14 +220,21 @@ class ArmatureMDM(nn.Module):
         else:
             raise ValueError(f"Unsupported timestep_embedder_type: {timestep_embedder_type}. Choose 'mlp' or 'gru'.")
         
-        # 4. Text Conditioning (Sentence-BERT)
-        logger.info(f"Loading Sentence-BERT model: {sbert_model_name}...")
-        self.sbert_model = self._load_and_freeze_sbert(sbert_model_name)
-        sbert_output_dim = self.sbert_model.get_sentence_embedding_dimension()
-        self.text_projection = nn.Linear(sbert_output_dim, latent_dim)
+        # 4. Text Conditioning (Sentence-BERT) pre-computed embeddings
+        logger.info(f"Loading SBERT embeddings from model: {sbert_model_name}")
+        if sbert_embedding_dim is None:
+            logger.warning("sbert_embedding_dim not provided to ArmatureMDM, but using precomputed embeddings. "
+                           "Make sure text_projection input dim matches precomputed SBERT dim.")
+            # Load the SBERT model and get its output dimension, just to ensure it is correct
+            temp_sbert = SentenceTransformer(sbert_model_name)
+            sbert_output_dim_actual = temp_sbert.get_sentence_embedding_dimension()
+            del temp_sbert  # Free memory
+        else:
+            sbert_output_dim_actual = sbert_embedding_dim
+
+        self.text_projection = nn.Linear(sbert_output_dim_actual, latent_dim)
         self.text_cond_dropout_prob = text_cond_dropout_prob
-        logger.info(f"Sentence-BERT model '{sbert_model_name}' loaded (Output: {sbert_output_dim}-dim). "
-                    f"Text embedding projected to latent_dim: {latent_dim}")
+        logger.info(f"Text embeddings (pre-computed) will be projected from {sbert_output_dim_actual} to latent_dim: {latent_dim}")
 
         # 5. Armature Class Conditioning
         logger.info(f"Armature class conditioning: Max classes {max_armature_classes}, Raw Embedding dim {armature_embedding_dim}")
@@ -402,7 +411,7 @@ class ArmatureMDM(nn.Module):
     def forward(self, 
                 x: torch.Tensor,
                 timesteps: torch.Tensor,
-                text_conditions: List[str],
+                text_embeddings_batch: torch.Tensor,
                 armature_class_ids: torch.Tensor,
                 uncond_text: bool = False,
                 uncond_armature: bool = False,
@@ -412,7 +421,7 @@ class ArmatureMDM(nn.Module):
         Forward pass for the ArmatureMDM model.
         :param x: Input motion tensor of shape [batch_size, num_frames, num_motion_features].
         :param timesteps: Tensor of shape [batch_size] containing timestep indices.
-        :param text_conditions: List of text conditions for each batch item.
+        :param text_embeddings_batch: Pre-computed text embeddings of shape [batch_size, sbert_embedding_dim].
         :param armature_class_ids: Tensor of shape [batch_size] containing armature class IDs.
         :param uncond_text: If True, applies dropout to the text embedding.
         :param uncond_armature: If True, applies dropout to the armature embedding.
@@ -426,8 +435,9 @@ class ArmatureMDM(nn.Module):
         time_emb = self.time_embedder(timesteps) # [bs, latent_dim]
 
         # 2. Text Embedding (processed)
-        sbert_embeddings = self.sbert_model.encode(text_conditions, convert_to_tensor=True, device=current_device, show_progress_bar=False)
-        projected_text_emb = self.text_projection(sbert_embeddings)
+        #sbert_embeddings = self.sbert_model.encode(text_conditions, convert_to_tensor=True, device=current_device, show_progress_bar=False)
+        #projected_text_emb = self.text_projection(sbert_embeddings)
+        projected_text_emb = self.text_projection(text_embeddings_batch.to(current_device))
         final_text_emb = self._apply_dropout_mask(projected_text_emb, 
                                                   prob=self.text_cond_dropout_prob, 
                                                   force_mask=uncond_text)

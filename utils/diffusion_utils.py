@@ -3,7 +3,10 @@ import os
 from typing import Dict, List
 
 import matplotlib.pyplot as plt
+import pandas as pd
+from sentence_transformers import SentenceTransformer
 import torch
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -187,3 +190,76 @@ def default_ddpm_noising_fn(target_x0: torch.Tensor,
     sqrt_one_minus_alpha_bar_t = torch.sqrt(1.0 - alphas_cumprod[t])
     
     return sqrt_alpha_bar_t * target_x0 + sqrt_one_minus_alpha_bar_t * epsilon
+
+
+def generate_and_save_sbert_embeddings(
+    annotations_csv_path: str,      # Es. "./data/annotations_train.csv"
+    sbert_model_name: str,          # Es. 'all-mpnet-base-v2'
+    output_embeddings_path: str,    # Es. "./data/sbert_embeddings_train.pt"
+    text_column_name: str = 'text',
+    device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
+):
+    """
+    Reads text prompts from an annotations CSV, computes their SBERT embeddings,
+    and saves them to a file as a dictionary mapping original text to embedding.
+    :param annotations_csv_path: Path to the CSV file containing text prompts.
+    :param sbert_model_name: Name of the SBERT model to use (e.g., 'all-mpnet-base-v2').
+    :param output_embeddings_path: Path to save the computed embeddings (as a .pt file).
+    :param text_column_name: Name of the column in the CSV containing the text prompts.
+    :param device: Device to load the SBERT model onto ('cuda' or 'cpu').
+    :return: None
+    """
+    logger.info(f"Starting SBERT embedding pre-computation...")
+    logger.info(f"Loading annotations from: {annotations_csv_path}")
+    try:
+        df = pd.read_csv(annotations_csv_path)
+        if text_column_name not in df.columns:
+            logger.error(f"Text column '{text_column_name}' not found in {annotations_csv_path}. Available columns: {df.columns.tolist()}")
+            return
+        
+        # Extract unique text prompts from the specified column
+        unique_texts = df[text_column_name].astype(str).unique().tolist()
+        logger.info(f"Found {len(unique_texts)} unique text prompts to embed.")
+        if not unique_texts:
+            logger.warning("No text prompts found in annotations. Nothing to embed.")
+            return
+
+    except FileNotFoundError:
+        logger.error(f"Annotations file not found: {annotations_csv_path}")
+        return
+    except Exception as e:
+        logger.error(f"Error reading annotations file {annotations_csv_path}: {e}")
+        return
+
+    logger.info(f"Loading SBERT model: {sbert_model_name} onto device: {device}")
+    try:
+        sbert_model = SentenceTransformer(sbert_model_name, device=device)
+    except Exception as e:
+        logger.error(f"Failed to load SBERT model '{sbert_model_name}': {e}")
+        return
+
+    embeddings_dict = {}
+    logger.info("Computing SBERT embeddings for unique texts...")
+    for text in tqdm(unique_texts, desc="Embedding Texts"):
+        try:
+            embedding = sbert_model.encode(text, convert_to_tensor=True, show_progress_bar=False)
+            embeddings_dict[text] = embedding.cpu() # Save on CPU to avoid CUDA memory issues
+        except Exception as e:
+            logger.warning(f"Could not compute embedding for text: '{text[:50]}...'. Error: {e}")
+            embeddings_dict[text] = None
+
+    # Filter out any texts that failed to compute embeddings
+    final_embeddings_dict = {k: v for k, v in embeddings_dict.items() if v is not None}
+    
+    if not final_embeddings_dict:
+        logger.error("No embeddings were successfully computed.")
+        return
+
+    logger.info(f"Successfully computed {len(final_embeddings_dict)} embeddings.")
+    
+    try:
+        os.makedirs(os.path.dirname(output_embeddings_path), exist_ok=True)
+        torch.save(final_embeddings_dict, output_embeddings_path)
+        logger.info(f"SBERT embeddings saved to: {output_embeddings_path}")
+    except Exception as e:
+        logger.error(f"Failed to save SBERT embeddings to {output_embeddings_path}: {e}")

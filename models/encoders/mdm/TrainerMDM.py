@@ -281,7 +281,7 @@ class ArmatureMDMTrainer:
         timesteps = batch_data["timesteps"].to(self.device) # Diffusion timesteps
         target_x0_for_main_loss = batch_data["target_x0"].to(self.device) # This is the ground truth clean motion, now the primary target
 
-        text_conditions = batch_data["text_conditions"] # List of strings
+        text_embeddings_batch = batch_data["text_embeddings"].to(self.device) # Tensor of text embeddings
         armature_class_ids = batch_data["armature_class_ids"].to(self.device) # Tensor of armature class IDs
 
         # --- Classifier-Free Guidance (CFG) Training Logic ---
@@ -311,7 +311,7 @@ class ArmatureMDMTrainer:
         predicted_x0 = self.model(
             x=x_noisy,  # Input is x_t (noisy motion)
             timesteps=timesteps,
-            text_conditions=text_conditions,
+            text_embeddings_batch=text_embeddings_batch,
             armature_class_ids=armature_class_ids,
             uncond_text=cfg_uncond_text,      # Pass CFG flag for text
             uncond_armature=cfg_uncond_armature, # Pass CFG flag for armature
