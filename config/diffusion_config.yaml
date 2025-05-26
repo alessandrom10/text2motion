@@ -1,0 +1,49 @@
+run_name: "diffusion_experiment_01"
+
+paths:
+  data_root_dir: "C:/PythonProjects/text2motion/data/"
+  annotations_file_name: "annotations_train.csv"
+  val_annotations_file_name: "annotations_val.csv"
+  motion_subdir: "new_joints"
+  model_save_dir: "./trained_models_final/"
+  model_filename: "armature_mdm_final.pth"
+
+diffusion_hyperparameters:
+  num_diffusion_timesteps: 1000
+
+model_hyperparameters:
+  num_motion_features: 66
+  latent_dim: 768
+  ff_size: 1024
+  num_layers: 8
+  num_heads: 4
+  dropout: 0.1
+  sbert_model_name: 'all-mpnet-base-v2'
+  max_armature_classes: 10
+  armature_embedding_dim: 64
+  text_time_cond_policy: "add"
+  armature_integration_policy: "add"
+  timestep_embedder_type: "mlp"
+
+training_hyperparameters:
+  batch_size: 32
+  num_epochs: 50
+  learning_rate: 0.0001
+  cfg_drop_prob_trainer: 0.1
+  device: "cuda"
+  use_lr_scheduler: true
+
+early_stopping:
+  early_stopping_patience: 10
+  early_stopping_min_delta: 0.0001
+
+kinematic_losses:
+  use_kinematic_losses: false
+  velocity_loss_weight: 0.0
+  acceleration_loss_weight: 0.0
+  kinematic_loss_type: "l1"
+
+dataset_parameters:
+  min_seq_len_dataset: 20
+  max_seq_len_dataset: 196
+  dataset_device: 'cpu'

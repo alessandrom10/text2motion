@@ -57,7 +57,7 @@ class TimestepEmbedder(nn.Module):
         super().__init__()
         self.latent_dim = latent_dim
         # Use the pe table from the provided positional encoder instance
-        self.time_pos_encoder_pe = pos_encoder.pe.squeeze(0) # [max_len, latent_dim]
+        self.time_pos_encoder_pe = pos_encoder
         
         self.mlp = nn.Sequential(
             nn.Linear(latent_dim, latent_dim),
@@ -71,7 +71,8 @@ class TimestepEmbedder(nn.Module):
         :param timesteps: Tensor of shape [batch_size] containing timestep indices
         :return: Timestep embedding of shape [batch_size, latent_dim]
         """
-        time_enc = self.time_pos_encoder_pe[timesteps.long()] # [bs, latent_dim]
+        time_pos_encoding_table = self.time_pos_encoder_pe.pe.squeeze(0).to(timesteps.device)
+        time_enc = time_pos_encoding_table[timesteps.long()] # [bs, latent_dim]
         return self.mlp(time_enc) # [bs, latent_dim]
 
 
@@ -97,7 +98,7 @@ class TimestepEmbedderGRU(nn.Module):
         """
         super().__init__()
         self.latent_dim = latent_dim
-        self.time_pos_encoder_pe = pos_encoder.pe.squeeze(0) # [max_len, latent_dim]
+        self.time_pos_encoder_pe = pos_encoder # [max_len, latent_dim]
         
         self.gru = nn.GRU(
             input_size=latent_dim,    # Input features to GRU is latent_dim (from pos_encoder)
@@ -113,7 +114,8 @@ class TimestepEmbedderGRU(nn.Module):
         :param timesteps: Tensor of shape [batch_size] containing timestep indices.
         :return: Timestep embedding of shape [batch_size, latent_dim].
         """
-        t_pos_enc = self.time_pos_encoder_pe[timesteps.long()] # [bs, latent_dim]
+        time_pos_encoding_table = self.time_pos_encoder_pe.pe.squeeze(0).to(timesteps.device)
+        t_pos_enc = time_pos_encoding_table[timesteps.long()] # [bs, latent_dim]
         t_pos_enc_seq = t_pos_enc.unsqueeze(1) # Convert to [bs, seq_len=1, latent_dim] for GRU
         
         # output_seq: [bs, 1, latent_dim], last_hidden: [num_gru_layers, bs, latent_dim]

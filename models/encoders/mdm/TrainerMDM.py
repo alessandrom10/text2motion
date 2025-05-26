@@ -9,97 +9,6 @@ from ArmatureMDM import ArmatureMDM
 
 logger = logging.getLogger(__name__)
 
-class MotionDataset(Dataset):
-    def __init__(self, motion_files, texts, armature_ids, num_diffusion_timesteps, alphas_cumprod, motion_processor_fn, tokenizer_fn=None):
-        """
-        Conceptual Dataset for motion data.
-        :param motion_files: List of paths to .npy motion files.
-        :param texts: List of corresponding text prompts.
-        :param armature_ids: List of corresponding armature class IDs.
-        :param num_diffusion_timesteps: Total number of diffusion timesteps (T).
-        :param alphas_cumprod: Cumulative products of (1-beta_t), used for noising.
-        :param motion_processor_fn: Function to load and preprocess a single motion file into clean x0 tensor.
-        :param tokenizer_fn: Optional function to tokenize text (if not handled by SBERT inside model).
-        """
-        self.motion_files = motion_files
-        self.texts = texts
-        self.armature_ids = armature_ids
-        self.num_diffusion_timesteps = num_diffusion_timesteps
-        self.alphas_cumprod = alphas_cumprod # Shape [T]
-        self.motion_processor = motion_processor_fn
-        # self.tokenizer = tokenizer_fn # If you tokenize text here
-
-        assert len(self.motion_files) == len(self.texts) == len(self.armature_ids), \
-            "Mismatch in lengths of inputs to Dataset."
-
-    def __len__(self):
-        return len(self.motion_files)
-
-    def __getitem__(self, idx):
-        motion_path = self.motion_files[idx]
-        text_condition = self.texts[idx]
-        armature_id = self.armature_ids[idx]
-
-        # 1. Load and preprocess motion to get clean x0
-        # target_x0 shape: (num_frames, num_motion_features)
-        target_x0 = self.motion_processor(motion_path)
-        num_frames = target_x0.shape[0]
-
-        # 2. Sample a random timestep t
-        # t is an integer from 0 to T-1 (or 1 to T depending on indexing)
-        # For DDPM, t is usually sampled from [0, T-1] for training.
-        t = torch.randint(0, self.num_diffusion_timesteps, (1,)).item() # A single integer timestep
-
-        # 3. Generate noise epsilon
-        epsilon = torch.randn_like(target_x0)
-
-        # 4. Calculate x_t (noisy motion) using x0, epsilon, and t
-        # x_t = sqrt(alpha_bar_t) * x0 + sqrt(1-alpha_bar_t) * epsilon
-        # Ensure alphas_cumprod is a tensor on the correct device
-        sqrt_alpha_bar_t = torch.sqrt(self.alphas_cumprod[t])
-        sqrt_one_minus_alpha_bar_t = torch.sqrt(1.0 - self.alphas_cumprod[t])
-        
-        x_noisy = sqrt_alpha_bar_t * target_x0 + sqrt_one_minus_alpha_bar_t * epsilon
-        
-        # For padding (conceptual, you'll need a proper collate_fn in DataLoader for this)
-        # motion_padding_mask = torch.ones(num_frames, dtype=torch.bool)
-
-        return {
-            "x_noisy": x_noisy.float(),  # Noisy input for the model
-            "target_x0": target_x0.float(), # Clean target for the x0-prediction model
-            "timesteps": torch.tensor(t, dtype=torch.long), # Timestep for the model
-            "text_conditions": text_condition, # Raw text string
-            "armature_class_ids": torch.tensor(armature_id, dtype=torch.long),
-            # "motion_padding_mask": motion_padding_mask # If using padding
-            # "target_noise": epsilon.float() # Not directly needed if model predicts x0
-        }
-
-# --- Noise Scheduler Example (Conceptual - you need your own) ---
-def get_noise_schedule(num_diffusion_timesteps=1000, beta_start=0.0001, beta_end=0.02):
-    betas = torch.linspace(beta_start, beta_end, num_diffusion_timesteps)
-    alphas = 1. - betas
-    alphas_cumprod = torch.cumprod(alphas, axis=0)
-    return betas, alphas, alphas_cumprod
-
-# --- Motion Processor Example (Conceptual) ---
-def process_motion_file(file_path, num_joints=22, num_coords=3):
-    # This should load your .npy file, normalize, flatten etc.
-    # The script you provided for visualization does:
-    # joints = np.load(file_path) # (T, num_joints, 3)
-    # joints = joints - joints[:, 0:1, :] # Root centering
-    # joints_m = joints / 1000.0 # Scale (if needed, or ensure data is already scaled)
-    # # Further normalization (e.g., to [-1, 1]) might be good.
-    # # Flatten:
-    # target_x0_np = joints_m.reshape(joints_m.shape[0], -1) # (T, num_joints * num_coords)
-    # return torch.from_numpy(target_x0_np)
-    # --- This is a placeholder - implement your full preprocessing ---
-    print(f"Warning: process_motion_file is a placeholder. Implement actual data loading for {file_path}")
-    # Example: return a dummy tensor of shape (sequence_length, num_features=66)
-    sequence_length = 100 # Placeholder
-    num_features = num_joints * num_coords
-    return torch.randn(sequence_length, num_features)
-
-
 class KinematicLossCalculator:
     """
     Class to compute kinematic losses (velocity, acceleration) on the predicted x0 from the ArmatureMDM model.
@@ -485,8 +394,8 @@ class ArmatureMDMTrainer:
             for key, val in batch_loss_components.items():
                 epoch_loss_components_sum[key] = epoch_loss_components_sum.get(key, 0.0) + val
 
-
-            if (batch_idx + 1) % max(1, num_batches // 10) == 0:
+            LOG_FREQ_BATCH = 50
+            if (batch_idx + 1) % LOG_FREQ_BATCH == 0 or (batch_idx + 1) == num_batches:
                 log_components = ", ".join([f"{k}: {v:.4f}" for k,v in batch_loss_components.items()])
                 logger.info(f"  Batch {batch_idx+1}/{num_batches}, Total Loss: {batch_total_loss.item():.4f} ({log_components})")
         

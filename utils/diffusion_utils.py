@@ -1,0 +1,189 @@
+import logging
+import os
+from typing import Dict, List
+
+import matplotlib.pyplot as plt
+import torch
+
+logger = logging.getLogger(__name__)
+
+
+def setup_logging(log_dir: str, run_name: str) -> None:
+    """
+    Sets up file and console logging for the training run.
+
+    :param log_dir: Directory to save the log file.
+    :param run_name: Name of the current run, used for the log filename.
+    """
+    os.makedirs(log_dir, exist_ok=True)
+    log_file_path = os.path.join(log_dir, f"training_log_{run_name}.txt")
+
+    log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - [%(name)s] - %(message)s')
+
+    file_handler = logging.FileHandler(log_file_path, mode='a')  # Append mode
+    file_handler.setFormatter(log_formatter)
+
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(log_formatter)
+
+    root_logger = logging.getLogger()
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+
+    root_logger.setLevel(logging.INFO)
+    root_logger.addHandler(file_handler)
+    root_logger.addHandler(console_handler)
+    logger.info(f"Logging setup complete. Log file: {log_file_path}")
+
+
+def get_noise_schedule(num_diffusion_timesteps: int,
+                       beta_start: float = 0.0001,
+                       beta_end: float = 0.02,
+                       device: torch.device = torch.device('cpu')) -> torch.Tensor:
+    """
+    Generates a linear beta schedule and corresponding alpha_cumprod values
+    as used in DDPMs.
+
+    :param num_diffusion_timesteps: The total number of diffusion steps (T).
+    :param beta_start: The starting value for beta at t=0 (or t=1 if 1-indexed).
+    :param beta_end: The ending value for beta at t=T.
+    :param device: The device to create the tensors on.
+    :return: Tensor of alpha_bar_t (cumulative product of alphas), shape [T].
+    """
+    betas = torch.linspace(beta_start, beta_end, num_diffusion_timesteps, dtype=torch.float32, device=device)
+    alphas = 1.0 - betas
+    alphas_cumprod = torch.cumprod(alphas, axis=0)
+    logger.debug(f"Generated noise schedule with {num_diffusion_timesteps} timesteps on device {device}.")
+    return alphas_cumprod
+
+
+def plot_training_history(history: Dict[str, List[float]],
+                            main_val_metric_name: str,
+                            model_save_dir: str,
+                            run_name: str) -> None:
+    """
+    Plots training & validation total loss, and a specified main validation metric.
+
+    :param history: Dictionary containing 'train_loss', 'val_loss', 'val_metric' lists.
+    :param main_val_metric_name: Name of the main validation metric for plotting title and label.
+    :param model_save_dir: Directory to save the plot.
+    :param run_name: Name of the current run, used for the plot filename.
+    """
+    train_losses_epochs = history.get('train_loss', [])
+    val_losses_epochs = history.get('val_loss', [])
+    val_main_metric_epochs = history.get('val_metric', [])
+
+    if not train_losses_epochs:
+        logger.warning("No training loss data provided to plot.")
+        return
+
+    num_train_epochs_completed = len(train_losses_epochs)
+    epochs_axis_train = range(1, num_train_epochs_completed + 1)
+
+    plt.figure(figsize=(14, 6))
+
+    plt.subplot(1, 2, 1)
+    plt.plot(epochs_axis_train, train_losses_epochs, 'bo-', label='Training Loss (Avg Total)')
+    if val_losses_epochs:
+        epochs_axis_val_loss = range(1, len(val_losses_epochs) + 1)
+        plt.plot(epochs_axis_val_loss, val_losses_epochs, 'ro-', label='Validation Loss (Avg Total)')
+    plt.title('Training & Validation Total Loss')
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True)
+
+    # Plot 2: Main Validation Metric
+    if val_main_metric_epochs:
+        epochs_axis_val_metric = range(1, len(val_main_metric_epochs) + 1)
+        plt.subplot(1, 2, 2)
+        plt.plot(epochs_axis_val_metric, val_main_metric_epochs, 'go-', label=f'Validation {main_val_metric_name}')
+        plt.title(f'Validation {main_val_metric_name}')
+        plt.xlabel('Epochs')
+        plt.ylabel(main_val_metric_name)
+        plt.legend()
+        plt.grid(True)
+    else:
+        logger.info("No main validation metric data provided for plotting.")
+
+
+    plt.tight_layout()
+    plot_save_path = os.path.join(model_save_dir, f"training_plots_{run_name}.png")
+    try:
+        plt.savefig(plot_save_path)
+        logger.info(f"Training plots saved to {plot_save_path}")
+    except Exception as e:
+        logger.error(f"Failed to save plots: {e}", exc_info=True)
+    # plt.show() # Typically commented out for non-interactive server runs
+
+
+def get_bone_mask_for_armature(armature_class_ids: torch.Tensor,
+                               num_total_motion_features: int,
+                               num_frames: int,
+                               device: str) -> torch.Tensor:
+    """
+    Generates a bone mask based on armature class IDs.
+    This is a placeholder and needs to be implemented or adapted
+    according to your specific armature definitions and how features map to them.
+    Currently, it creates a mask that activates all features for all samples.
+
+    :param armature_class_ids: Tensor of armature class IDs for the batch. Shape: (batch_size,).
+    :param num_total_motion_features: Total number of features in the motion data (e.g., joints * coords).
+    :param num_frames: Number of frames in the motion sequence.
+    :param device: Device to create the mask tensor on (e.g., 'cuda', 'cpu').
+    :return: Bone mask tensor of shape (batch_size, num_frames, num_total_motion_features),
+             with 1s for active features and 0s for inactive ones.
+    """
+    batch_size = armature_class_ids.shape[0]
+    
+    # Placeholder logic: Assumes a single, default armature where all features are active.
+    # TODO: Implement actual logic based on different armature_class_ids if you have multiple
+    #       armature types with different active joints/features.
+    #       For example:
+    #       mask = torch.zeros((batch_size, num_frames, num_total_motion_features), device=device, dtype=torch.float32)
+    #       for i in range(batch_size):
+    #           if armature_class_ids[i].item() == ARMATURE_TYPE_A_ID:
+    #               mask[i, :, indices_for_armature_A] = 1.0
+    #           elif armature_class_ids[i].item() == ARMATURE_TYPE_B_ID:
+    #               mask[i, :, indices_for_armature_B] = 1.0
+    #       return mask
+    
+    # Current placeholder returns all ones (all features active for all samples)
+    mask = torch.ones((batch_size, num_frames, num_total_motion_features), device=device, dtype=torch.float32)
+    logger.debug(f"Generated bone mask for {batch_size} samples. Current logic activates all features.")
+    return mask
+
+def default_uniform_timestep_sampler(num_diffusion_timesteps: int) -> int:
+    """
+    Samples a timestep uniformly at random.
+    :param num_diffusion_timesteps: The total number of diffusion timesteps (T).
+    :return: A randomly sampled integer timestep t (from 0 to T-1).
+    """
+    return torch.randint(0, num_diffusion_timesteps, (1,)).item()
+
+def default_gaussian_noise_fn(target_x0_shape: tuple, device: torch.device) -> torch.Tensor:
+    """
+    Generates standard Gaussian noise with the given shape and device.
+    :param target_x0_shape: The shape of the target_x0 tensor (e.g., (num_frames, num_features)).
+    :param device: The device to create the noise tensor on.
+    :return: A noise tensor epsilon.
+    """
+    return torch.randn(target_x0_shape, device=device)
+
+def default_ddpm_noising_fn(target_x0: torch.Tensor,
+                             epsilon: torch.Tensor,
+                             t: int,
+                             alphas_cumprod: torch.Tensor) -> torch.Tensor:
+    """
+    Applies noise to target_x0 according to the DDPM forward process formula.
+    x_t = sqrt(alpha_bar_t) * x0 + sqrt(1-alpha_bar_t) * epsilon
+    :param target_x0: The clean data tensor.
+    :param epsilon: The noise tensor.
+    :param t: The current timestep.
+    :param alphas_cumprod: Tensor of cumulative products of alphas (should be on the same device as t is indexed on, usually CPU).
+    :return: The noised data tensor x_t.
+    """
+    sqrt_alpha_bar_t = torch.sqrt(alphas_cumprod[t])
+    sqrt_one_minus_alpha_bar_t = torch.sqrt(1.0 - alphas_cumprod[t])
+    
+    return sqrt_alpha_bar_t * target_x0 + sqrt_one_minus_alpha_bar_t * epsilon

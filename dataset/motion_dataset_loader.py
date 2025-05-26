@@ -7,51 +7,79 @@ import os
 import logging
 from typing import Callable, Optional, List, Dict, Any
 from dataset.dataset import TextToMotionDataset
+from utils.diffusion_utils import default_uniform_timestep_sampler, default_gaussian_noise_fn, default_ddpm_noising_fn
 
 logger = logging.getLogger(__name__)
 
 # --- Default Utility Functions ---
-def default_uniform_timestep_sampler(num_diffusion_timesteps: int) -> int:
+def collate_motion_data(batch: List[Optional[Dict[str, Any]]]) -> Dict[str, Any]:
     """
-    Samples a timestep uniformly at random.
-    :param num_diffusion_timesteps: The total number of diffusion timesteps (T).
-    :return: A randomly sampled integer timestep t (from 0 to T-1).
-    """
-    return torch.randint(0, num_diffusion_timesteps, (1,)).item()
+    Collate function for motion data, handling padding for variable-length sequences.
+    It filters out None items (samples that failed to load), pads tensor sequences
+    to the maximum length in the batch, and creates a padding mask.
 
-def default_gaussian_noise_fn(target_x0_shape: tuple, device: torch.device) -> torch.Tensor:
+    :param batch: A list of dictionaries, where each dict is an output from 
+                  MyTextToMotionDataset.__getitem__. Items can be None if 
+                  __getitem__ failed for a particular sample.
+    :return: A dictionary containing the collated batch data, with sequences
+             padded and a 'motion_padding_mask' created. Returns an empty
+             dictionary if the batch is empty after filtering None items.
     """
-    Generates standard Gaussian noise with the given shape and device.
-    :param target_x0_shape: The shape of the target_x0 tensor (e.g., (num_frames, num_features)).
-    :param device: The device to create the noise tensor on.
-    :return: A noise tensor epsilon.
-    """
-    return torch.randn(target_x0_shape, device=device)
+    # Filter out None items that might result from errors in __getitem__
+    valid_batch_items = [item for item in batch if item is not None]
 
-def default_ddpm_noising_fn(target_x0: torch.Tensor,
-                             epsilon: torch.Tensor,
-                             t: int,
-                             alphas_cumprod: torch.Tensor) -> torch.Tensor:
-    """
-    Applies noise to target_x0 according to the DDPM forward process formula.
-    x_t = sqrt(alpha_bar_t) * x0 + sqrt(1-alpha_bar_t) * epsilon
-    :param target_x0: The clean data tensor.
-    :param epsilon: The noise tensor.
-    :param t: The current timestep.
-    :param alphas_cumprod: Tensor of cumulative products of alphas (should be on the same device as t is indexed on, usually CPU).
-    :return: The noised data tensor x_t.
-    """
-    sqrt_alpha_bar_t = torch.sqrt(alphas_cumprod[t])
-    sqrt_one_minus_alpha_bar_t = torch.sqrt(1.0 - alphas_cumprod[t])
+    if not valid_batch_items:
+        logger.warning("collate_motion_data received an empty or all-None batch.")
+        return {}
+
+    collated_batch: Dict[str, Any] = {}
+    first_item_keys = valid_batch_items[0].keys()
+
+    for key in first_item_keys:
+        if key == "text_conditions":
+            collated_batch[key] = [item[key] for item in valid_batch_items]
+        elif torch.is_tensor(valid_batch_items[0][key]):
+            if key in ["x_noisy", "target_x0"]:
+                sequences = [item[key] for item in valid_batch_items]
+                collated_batch[key] = pad_sequence(sequences, batch_first=True, padding_value=0.0)
+            else:
+                try:
+                    collated_batch[key] = torch.stack([item[key] for item in valid_batch_items])
+                except Exception as e:
+                    logger.error(f"Error stacking tensor for key '{key}': {e}. "
+                                 f"Item shapes: {[item[key].shape for item in valid_batch_items if key in item]}", exc_info=True)
+                    raise
+
+    if "seq_len" in collated_batch and ("x_noisy" in collated_batch or "target_x0" in collated_batch):
+        padded_sequence_key = "x_noisy" if "x_noisy" in collated_batch else "target_x0"
+        max_len = collated_batch[padded_sequence_key].shape[1]
+        
+        seq_lengths_tensor = collated_batch["seq_len"]
+        if not isinstance(seq_lengths_tensor, torch.Tensor):
+            try:
+                seq_lengths_tensor = torch.tensor(seq_lengths_tensor, dtype=torch.long)
+            except TypeError:
+                logger.error(f"seq_len in batch is not a tensor and could not be converted. Type: {type(seq_lengths_tensor)}")
     
-    return sqrt_alpha_bar_t * target_x0 + sqrt_one_minus_alpha_bar_t * epsilon
+        try:
+            motion_padding_mask = torch.arange(max_len, device=seq_lengths_tensor.device).expand(len(valid_batch_items), max_len) >= seq_lengths_tensor.unsqueeze(1)
+            collated_batch["motion_padding_mask"] = motion_padding_mask
+        except Exception as e:
+            logger.error(f"Error creating motion_padding_mask: {e}. Max_len: {max_len}, seq_lengths: {seq_lengths_tensor}", exc_info=True)
+            raise
+
+    if "seq_len" in collated_batch:
+        del collated_batch["seq_len"]
+
+    return collated_batch
+
 
 # --- Motion Processing Function ---
 def process_motion_file(file_path: str, num_expected_features: int) -> torch.Tensor:
     """
-    Loads, preprocesses, and flattens a single .npy motion file.
+    Loads, preprocesses, and flattens a single .npz motion file.
     This should return the clean x0.
-    :param file_path: Path to the .npy motion file.
+    :param file_path: Path to the .npz motion file.
     :param num_expected_features: Expected number of features after flattening (e.g., joints * coords).
     :return: Processed motion tensor x0 of shape (num_frames, num_motion_features).
     """
@@ -188,7 +216,7 @@ class MyTextToMotionDataset(TextToMotionDataset):
         The 'animation' parameter from the abstract class's __getitem__ is interpreted
         as the motion_file_path here, passed from our concrete __getitem__.
         Return value is adapted: returns processed x0 tensor (motion features).
-        :param motion_file_path: Path to the motion file (e.g., .npy).
+        :param motion_file_path: Path to the motion file (e.g., .npz).
         :return: Processed motion tensor x0 of shape (num_frames, num_motion_features).
         """
         return self.motion_processor(motion_file_path, num_expected_features=self.num_motion_features)
