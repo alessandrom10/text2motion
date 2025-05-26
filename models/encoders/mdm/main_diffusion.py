@@ -16,7 +16,7 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 from ArmatureMDM import ArmatureMDM
-from TrainerMDM import ArmatureMDMTrainer, KinematicLossCalculator
+from TrainerMDM import ArmatureMDMTrainer, KinematicLossCalculator, MDMGeometricLosses
 
 from dataset.motion_dataset_loader import (
     MyTextToMotionDataset, 
@@ -25,6 +25,7 @@ from dataset.motion_dataset_loader import (
 )
 
 from utils.diffusion_utils import (
+    load_armature_config,
     setup_logging,
     get_noise_schedule,
     plot_training_history,
@@ -150,7 +151,21 @@ def run_training_pipeline(config: Dict[str, Any]) -> None:
     run_name = config.get('run_name', 'default_run')
     paths_config = config.get('paths', {})
     model_save_dir = paths_config.get('model_save_dir', './trained_models_output')
+
+    # Load armature configuration
+    default_armature_cfg_file = Path(project_root) / 'config' / 'armature_config.json'
+    armature_config_file = paths_config.get('armature_config_file', str(default_armature_cfg_file))
     
+    if not os.path.isabs(armature_config_file):
+        armature_config_file = os.path.join(project_root, armature_config_file)
+
+    loaded_armature_config_data = load_armature_config(armature_config_file) # load_armature_config from utils
+
+    if loaded_armature_config_data is None:
+        logger.warning("Armature configuration could not be loaded. Bone masking might not work as expected.")
+        # Potentially set a default or raise an error if it's critical
+        loaded_armature_config_data = {} # Empty dict as fallback
+
     setup_logging(model_save_dir, run_name)
     
     logger.info(f"======= Starting Training Run: {run_name} =======")
@@ -319,13 +334,33 @@ def run_training_pipeline(config: Dict[str, Any]) -> None:
             )
     logger.info(f"Kinematic losses {'ENABLED' if kinematic_calculator else 'DISABLED'}")
 
+    mdm_geom_loss_calc = None
+    mdm_geom_cfg = config.get('mdm_geometric_losses', {})
+    if mdm_geom_cfg.get('use_mdm_geometric_losses', False):
+        logger.info("Initializing MDMGeometricLosses calculator...")
+        mdm_geom_loss_calc = MDMGeometricLosses(
+            lambda_pos=mdm_geom_cfg.get('lambda_pos', 0.0),
+            lambda_vel=mdm_geom_cfg.get('lambda_vel', 0.0), # Set to 0 if you only want L_foot
+            lambda_foot=mdm_geom_cfg.get('lambda_foot', 0.0), # Set >0 to activate
+            num_joints=model_hparams.get('num_joints_for_geom', 22),
+            features_per_joint=model_hparams.get('features_per_joint_for_geom', 3),
+            foot_joint_indices=mdm_geom_cfg.get('foot_joint_indices', [10, 11]), # Example
+            device=str(device),
+            get_bone_mask_fn=get_bone_mask_for_armature # Optional: for further masking geometric losses
+        )
+    logger.info(f"MDMGeometricLosses calculator {'ENABLED' if mdm_geom_loss_calc else 'DISABLED'}")
+
     # 6. Initialize Trainer (as in your script)
     trainer = ArmatureMDMTrainer(
-        model=model, optimizer=optimizer, get_bone_mask_fn=get_bone_mask_for_armature,
+        model=model, 
+        optimizer=optimizer, 
+        get_bone_mask_fn=get_bone_mask_for_armature,
+        armature_config_data=loaded_armature_config_data,
         device=str(device), lr_scheduler=lr_scheduler,
         main_loss_type=training_hparams.get('main_loss_type', "mse"),
         cfg_drop_prob=training_hparams.get('cfg_drop_prob_trainer', 0.1),
         kinematic_loss_calculator=kinematic_calculator,
+        mdm_geometric_loss_calculator=mdm_geom_loss_calc,
         early_stopping_patience=early_stopping_params.get('patience', 10),
         early_stopping_min_delta=early_stopping_params.get('min_delta', 0.0001),
         model_save_path=os.path.join(model_save_dir, paths_config.get('model_filename', 'model.pth'))
