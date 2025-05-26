@@ -3,12 +3,227 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from typing import Dict, Any, Callable, Literal, Optional, Tuple 
+from typing import Dict, Any, Callable, List, Literal, Optional, Tuple 
 import logging
 from tqdm.auto import tqdm
 from ArmatureMDM import ArmatureMDM
 
 logger = logging.getLogger(__name__)
+
+
+class MDMGeometricLosses(nn.Module):
+    """
+    Calculates geometric losses as described in the MDM paper:
+    L_pos (if applicable, assuming x0 is already positions), L_vel, and L_foot.
+    The losses are MSE based, as per the paper.
+    """
+    def __init__(self,
+                 lambda_pos: float = 0.0, # Weight for position loss
+                 lambda_vel: float = 1.0, # Weight for velocity loss
+                 lambda_foot: float = 1.0, # Weight for foot contact loss
+                 num_joints: int = 22,     # Total number of joints in the representation
+                 features_per_joint: int = 3, # e.g., 3 for XYZ
+                 foot_joint_indices: Optional[List[int]] = None, # Indices of left and right foot joints
+                 device: str = 'cpu',
+                 # Optional: if you want to apply your get_bone_mask_fn to these losses too
+                 get_bone_mask_fn: Optional[Callable[[torch.Tensor, int, int, str], torch.Tensor]] = None
+                ):
+        """
+        Initializes the MDMGeometricLosses module.
+        :param lambda_pos: Weight for position loss (L_pos).
+        :param lambda_vel: Weight for velocity loss (L_vel).
+        :param lambda_foot: Weight for foot contact loss (L_foot).
+        :param num_joints: Total number of joints in the motion representation.
+        :param features_per_joint: Number of features per joint (e.g., 3 for XYZ).
+        :param foot_joint_indices: Optional list of indices for foot joints (e.g., [10, 11] for L_Foot, R_Foot).
+                                   If None, defaults to HumanML3D-like indices.
+        :param device: Device to run the calculations on (e.g., "cuda" or "cpu").
+        :param get_bone_mask_fn: Optional function to get a bone mask for active features.
+                                 Should take (armature_class_ids, num_total_features, num_frames, device) and return a mask.
+        """
+        super().__init__()
+        self.lambda_pos = lambda_pos
+        self.lambda_vel = lambda_vel
+        self.lambda_foot = lambda_foot
+        
+        self.num_joints = num_joints
+        self.features_per_joint = features_per_joint # Should be 3 for XYZ
+        if self.features_per_joint != 3:
+            logger.warning(f"MDMGeometricLosses expects features_per_joint=3 for XYZ. "
+                           f"Received {self.features_per_joint}. FK might be needed if not XYZ.")
+
+        if foot_joint_indices is None:
+            # Default HumanML3D-like foot joint indices (L_Foot, R_Foot)
+            # Adjust these if your joint order is different!
+            # Based on t2m_kinematic_chain: L_Foot=10, R_Foot=11
+            self.foot_joint_indices = [10, 11] 
+            logger.info(f"Using default foot joint indices: {self.foot_joint_indices}")
+        else:
+            self.foot_joint_indices = foot_joint_indices
+            logger.info(f"Using provided foot joint indices: {self.foot_joint_indices}")
+            
+        self.device = device
+        self.get_bone_mask_fn = get_bone_mask_fn # For overall armature-based masking
+
+        if self.lambda_foot > 0 and not self.foot_joint_indices:
+            logger.warning("lambda_foot > 0 but no foot_joint_indices provided. Foot contact loss will be zero.")
+        
+        logger.info(f"MDMGeometricLosses initialized with weights: "
+                    f"Pos={self.lambda_pos}, Vel={self.lambda_vel}, FootContact={self.lambda_foot}")
+
+    def _calculate_derivative(self, motion_sequence: torch.Tensor) -> torch.Tensor:
+        """ Calculates the first derivative (velocity). motion_sequence: [bs, num_frames, features] """
+        if motion_sequence.shape[1] < 2:
+            return torch.empty_like(motion_sequence[:, :0, :])
+        return motion_sequence[:, 1:] - motion_sequence[:, :-1]
+
+    def compute_losses(self,
+                       predicted_x0: torch.Tensor, # Shape: [bs, num_frames, num_total_features]
+                       target_x0: torch.Tensor,    # Shape: [bs, num_frames, num_total_features]
+                       # foot_contact_gt: Shape [bs, num_frames, num_joints], binary 1 for contact
+                       foot_contact_gt: Optional[torch.Tensor] = None, 
+                       armature_class_ids: Optional[torch.Tensor] = None # For get_bone_mask_fn
+                      ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """
+        Computes the weighted sum of geometric losses.
+
+        :param predicted_x0: Model's prediction of clean motion (joint positions).
+        :param target_x0: Ground truth clean motion (joint positions).
+        :param foot_contact_gt: Ground truth binary foot contact mask (1 for contact, 0 for air).
+                                 Shape: [bs, num_frames, num_joints]. Required if lambda_foot > 0.
+        :param armature_class_ids: Tensor of armature class IDs for applying get_bone_mask_fn.
+        :return: Tuple (total_weighted_geometric_loss, dictionary_of_individual_losses).
+        """
+        bs, num_frames, num_total_features = predicted_x0.shape
+        
+        if num_total_features != self.num_joints * self.features_per_joint:
+            logger.error(f"Feature dimension mismatch! num_total_features ({num_total_features}) "
+                         f"!= num_joints ({self.num_joints}) * features_per_joint ({self.features_per_joint}). "
+                         f"Cannot reliably apply geometric losses.")
+            return torch.tensor(0.0, device=self.device, requires_grad=predicted_x0.requires_grad), {}
+
+        losses = {}
+        total_geometric_loss = torch.tensor(0.0, device=self.device, requires_grad=predicted_x0.requires_grad)
+
+        # Optional overall bone mask based on armature_class_id
+        overall_bone_mask = None
+        if self.get_bone_mask_fn is not None and armature_class_ids is not None:
+            overall_bone_mask = self.get_bone_mask_fn(
+                armature_class_ids, num_total_features, num_frames, str(self.device)
+            ) # Shape: [bs, num_frames, num_total_features]
+
+
+        # 1. L_pos (Position Loss) - MDM paper uses this if predicting rotations, FK is identity if predicting positions.
+        # Your main_x0_loss already covers this if it's MSE on positions.
+        # We include it here for completeness or if you want to weight it differently or apply a different mask.
+        if self.lambda_pos > 0:
+            # Assuming predicted_x0 and target_x0 are already joint positions (FK is identity)
+            pos_loss_elementwise = F.mse_loss(predicted_x0, target_x0, reduction='none')
+            if overall_bone_mask is not None:
+                pos_loss_elementwise = pos_loss_elementwise * overall_bone_mask
+                num_active = overall_bone_mask.sum()
+            else:
+                num_active = torch.tensor(pos_loss_elementwise.numel(), device=self.device)
+
+            l_pos = pos_loss_elementwise.sum() / (num_active + 1e-8) if num_active > 0 else torch.tensor(0.0, device=self.device)
+            total_geometric_loss += self.lambda_pos * l_pos
+            losses['geom_pos_loss'] = l_pos.item()
+
+        # 2. L_vel (Velocity Loss)
+        if self.lambda_vel > 0 and num_frames > 1:
+            pred_vel = self._calculate_derivative(predicted_x0) # [bs, num_frames-1, num_features]
+            target_vel = self._calculate_derivative(target_x0) # [bs, num_frames-1, num_features]
+
+            if pred_vel.shape[1] > 0: # If velocity could be computed
+                vel_loss_elementwise = F.mse_loss(pred_vel, target_vel, reduction='none')
+                
+                current_mask = None
+                if overall_bone_mask is not None:
+                    # Apply mask, considering sequence length is num_frames-1 for velocity
+                    current_mask = overall_bone_mask[:, 1:, :] # Or overall_bone_mask[:, :pred_vel.shape[1], :]
+                    vel_loss_elementwise = vel_loss_elementwise * current_mask
+                    num_active = current_mask.sum()
+                else:
+                    num_active = torch.tensor(vel_loss_elementwise.numel(), device=self.device)
+
+                l_vel = vel_loss_elementwise.sum() / (num_active + 1e-8) if num_active > 0 else torch.tensor(0.0, device=self.device)
+                total_geometric_loss += self.lambda_vel * l_vel
+                losses['geom_vel_loss'] = l_vel.item()
+
+        # 3. L_foot (Foot Contact Loss)
+        if self.lambda_foot > 0 and num_frames > 1 and self.foot_joint_indices:
+            if foot_contact_gt is None:
+                logger.warning("Foot contact loss (lambda_foot > 0) but foot_contact_gt is None. Skipping L_foot.")
+            elif foot_contact_gt.shape[2] != self.num_joints:
+                 logger.warning(f"Foot contact GT shape mismatch. Expected {self.num_joints} joints, got {foot_contact_gt.shape[2]}. Skipping L_foot.")
+            else:
+                # Reshape predicted_x0 to [bs, num_frames, num_joints, features_per_joint]
+                pred_x0_reshaped = predicted_x0.reshape(bs, num_frames, self.num_joints, self.features_per_joint)
+                
+                # Predicted velocities of all joints
+                pred_all_joint_vel = self._calculate_derivative(pred_x0_reshaped) # [bs, num_frames-1, num_joints, feat_per_joint]
+
+                # Select velocities of foot joints
+                pred_foot_vel = pred_all_joint_vel[:, :, self.foot_joint_indices, :] # [bs, num_frames-1, num_foot_joints, feat_per_joint]
+                
+                # Ground truth foot contact mask $f_i$ for the N-1 velocity frames, for foot joints
+                # foot_contact_gt is [bs, num_frames, num_joints]
+                # We need it for num_frames-1 and for the specific foot_joint_indices
+                # The paper's loss is on (vel * f_i). It penalizes velocity if f_i=1.
+                # So, we select foot velocities where contact is True (f_i=1).
+                
+                # Align foot_contact_gt with velocity frames (num_frames-1)
+                # Use $f_i$ to penalize $v_i = x_{i+1} - x_i$. So, $f_i$ should correspond to frame $i$.
+                # $v_0$ uses $x_1, x_0$. $f_0$ applies to $v_0$.
+                # $v_{N-2}$ uses $x_{N-1}, x_{N-2}$. $f_{N-2}$ applies to $v_{N-2}$.
+                # So, foot_contact_gt should be sliced for frames [0 to N-2] to match velocity frames.
+                foot_contact_mask_for_vel = foot_contact_gt[:, :num_frames-1, :] # [bs, num_frames-1, num_joints]
+                
+                # Select contact mask for foot joints
+                active_foot_contact = foot_contact_mask_for_vel[:, :, self.foot_joint_indices] # [bs, num_frames-1, num_foot_joints]
+                active_foot_contact = active_foot_contact.unsqueeze(-1).expand_as(pred_foot_vel) # Expand to XYZ dims: [bs, N-1, n_feet, feat_per_joint]
+
+                # Penalize foot velocities WHEN foot_contact is 1 (active_foot_contact is 1)
+                # The loss is || (predicted_foot_velocity) * (foot_contact_is_1) ||^2
+                # which means we want predicted_foot_velocity to be 0 when foot_contact_is_1.
+                # This is equivalent to an MSE loss between (predicted_foot_velocity * foot_contact_is_1) and 0.
+                foot_vel_to_penalize = pred_foot_vel * active_foot_contact # Zeroes out velocities when contact is 0
+                
+                l_foot_elementwise = F.mse_loss(foot_vel_to_penalize, 
+                                                torch.zeros_like(foot_vel_to_penalize), 
+                                                reduction='none')
+                
+                # Optional: Apply overall_bone_mask to foot contact loss
+                # This is more complex as overall_bone_mask is [bs, N, total_features]
+                # We need to select features corresponding to foot_joint_indices and slice for N-1 frames.
+                if overall_bone_mask is not None:
+                    # Create a specific mask for the foot joint features from overall_bone_mask
+                    # This part needs careful implementation if you want fine-grained armature masking on foot loss.
+                    # For simplicity now, we apply loss over all components of active foot joints.
+                    # If you need to mask specific XYZ of specific feet based on overall_bone_mask:
+                    mask_for_foot_loss = torch.zeros_like(foot_vel_to_penalize, device=self.device)
+                    temp_overall_bone_mask_vel = overall_bone_mask[:, 1:, :] # for N-1 frames
+                    for j_idx, actual_joint_idx in enumerate(self.foot_joint_indices):
+                        start_feat = actual_joint_idx * self.features_per_joint
+                        end_feat = start_feat + self.features_per_joint
+                        mask_for_foot_loss[:, :, j_idx, :] = temp_overall_bone_mask_vel[:, :, start_feat:end_feat]
+                    l_foot_elementwise = l_foot_elementwise * mask_for_foot_loss
+                    num_active = mask_for_foot_loss.sum() * active_foot_contact.sum() / (active_foot_contact.numel() + 1e-8) # Approximate active for overall mask
+                else:
+                    # Normalize by number of elements where foot contact is 1
+                    num_active = active_foot_contact.sum()
+
+                l_foot = l_foot_elementwise.sum() / (num_active + 1e-8) if num_active > 0 else torch.tensor(0.0, device=self.device)
+                total_geometric_loss += self.lambda_foot * l_foot
+                losses['geom_foot_loss'] = l_foot.item()
+        
+        if hasattr(total_geometric_loss, 'requires_grad') and predicted_x0.requires_grad and not total_geometric_loss.requires_grad and total_geometric_loss == 0.0:
+            # Ensure loss requires grad if model is in training and loss is zero,
+            # to prevent issues if this is the only loss component with non-zero weight.
+            total_geometric_loss = total_geometric_loss.clone().requires_grad_(True)
+
+        return total_geometric_loss, losses
+
 
 class KinematicLossCalculator:
     """
@@ -190,11 +405,13 @@ class ArmatureMDMTrainer:
                     model: ArmatureMDM,
                     optimizer: optim.Optimizer,
                     get_bone_mask_fn: Callable[[torch.Tensor, int, int, str], torch.Tensor],
+                    armature_config_data: Optional[Dict] = None,
                     device: str = "cuda" if torch.cuda.is_available() else "cpu",
                     lr_scheduler: Optional[Any] = None,
                     main_loss_type: Literal["l1", "mse"] = "mse",  # for x0 prediction.
                     cfg_drop_prob: float = 0.1, # Probability of dropping conditions for CFG training
                     kinematic_loss_calculator: Optional[KinematicLossCalculator] = None,
+                    mdm_geometric_loss_calculator: Optional[Any] = None,
                     early_stopping_patience: int = 10,
                     early_stopping_min_delta: float = 0.01,
                     model_save_path: Optional[str] = 'armature_mdm_best_model.pth'  # Path to save the best model
@@ -204,11 +421,13 @@ class ArmatureMDMTrainer:
         :param model: Instance of ArmatureMDM model.
         :param optimizer: Optimizer for training the model.
         :param get_bone_mask_fn: Function to get bone mask for active features.
+        :param armature_config_data: Optional configuration data for the armature (e.g., bone names, joint indices).
         :param device: Device to run the model on (default: "cuda" if available).
         :param lr_scheduler: Optional learning rate scheduler.
         :param main_loss_type: Type of loss for x0 prediction ('l1' or 'mse').
         :param cfg_drop_prob: Probability of dropping conditions for CFG training.
         :param kinematic_loss_calculator: Optional KinematicLossCalculator instance for kinematic losses.
+        :param mdm_geometric_loss_calculator: Optional MDMGeometricLosses instance for geometric losses.
         :param early_stopping_patience: Number of epochs with no improvement after which training will be stopped.
         :param early_stopping_min_delta: Minimum change in the monitored quantity to qualify as an improvement.
         :param model_save_path: Path to save the best model during training.
@@ -216,11 +435,13 @@ class ArmatureMDMTrainer:
         self.model = model.to(device)
         self.optimizer = optimizer
         self.get_bone_mask_fn = get_bone_mask_fn
+        self.armature_config_data = armature_config_data
         self.device = device
         self.lr_scheduler = lr_scheduler
         self.main_loss_type = main_loss_type
         self.cfg_drop_prob = cfg_drop_prob
         self.kinematic_loss_calculator = kinematic_loss_calculator
+        self.mdm_geometric_loss_calculator = mdm_geometric_loss_calculator
 
         self.early_stopping_patience = early_stopping_patience
         self.early_stopping_min_delta = early_stopping_min_delta
@@ -320,7 +541,11 @@ class ArmatureMDMTrainer:
 
         # Get the bone mask for the full sequence length (of x0)
         bone_mask_full_seq = self.get_bone_mask_fn(
-            armature_class_ids, num_total_motion_features, num_frames, self.device
+            armature_class_ids, 
+            num_total_motion_features, 
+            num_frames,
+            self.device,
+            armature_config_data=self.armature_config_data
         )
 
         # --- Main Loss Calculation (on predicted x0) ---
@@ -355,6 +580,21 @@ class ArmatureMDMTrainer:
             )
             current_total_loss += kin_loss
             loss_components.update(kin_losses_dict)
+
+        # --- Optional MDM Geometric Losses ---
+        if self.mdm_geometric_loss_calculator:
+            foot_contact_gt = batch_data.get("foot_contact_ground_truth")
+            if foot_contact_gt is not None:
+                foot_contact_gt = foot_contact_gt.to(self.device)
+            
+            mdm_geom_loss, mdm_geom_losses_dict = self.mdm_geometric_loss_calculator.compute_losses(
+                predicted_x0=predicted_x0,
+                target_x0=target_x0_for_main_loss,
+                foot_contact_gt=foot_contact_gt,
+                armature_class_ids=armature_class_ids
+            )
+            current_total_loss += mdm_geom_loss
+            loss_components.update(mdm_geom_losses_dict)
 
         return current_total_loss, loss_components
 
