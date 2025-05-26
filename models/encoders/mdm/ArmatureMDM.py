@@ -426,7 +426,7 @@ class ArmatureMDM(nn.Module):
         time_emb = self.time_embedder(timesteps) # [bs, latent_dim]
 
         # 2. Text Embedding (processed)
-        sbert_embeddings = self.sbert_model.encode(text_conditions, convert_to_tensor=True, device=current_device)
+        sbert_embeddings = self.sbert_model.encode(text_conditions, convert_to_tensor=True, device=current_device, show_progress_bar=False)
         projected_text_emb = self.text_projection(sbert_embeddings)
         final_text_emb = self._apply_dropout_mask(projected_text_emb, 
                                                   prob=self.text_cond_dropout_prob, 

@@ -5,6 +5,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from typing import Dict, Any, Callable, Literal, Optional, Tuple 
 import logging
+from tqdm.auto import tqdm
 from ArmatureMDM import ArmatureMDM
 
 logger = logging.getLogger(__name__)
@@ -370,8 +371,9 @@ class ArmatureMDMTrainer:
         epoch_total_loss = 0.0
         epoch_loss_components_sum: Dict[str, float] = {} # To average individual losses
         num_batches = len(data_loader)
+        batch_iterator = tqdm(data_loader, desc=f"Training Epoch Progress", total=num_batches, leave=True)
 
-        for batch_idx, batch_data in enumerate(data_loader):
+        for batch_idx, batch_data in enumerate(batch_iterator):
             self.optimizer.zero_grad()
             batch_total_loss, batch_loss_components = self._run_batch(batch_data, is_training_model=True)
             
@@ -394,11 +396,12 @@ class ArmatureMDMTrainer:
             for key, val in batch_loss_components.items():
                 epoch_loss_components_sum[key] = epoch_loss_components_sum.get(key, 0.0) + val
 
-            LOG_FREQ_BATCH = 50
-            if (batch_idx + 1) % LOG_FREQ_BATCH == 0 or (batch_idx + 1) == num_batches:
+            if (batch_idx + 1) % max(1, num_batches // 10) == 0: # Log every 10% of batches
                 log_components = ", ".join([f"{k}: {v:.4f}" for k,v in batch_loss_components.items()])
                 logger.info(f"  Batch {batch_idx+1}/{num_batches}, Total Loss: {batch_total_loss.item():.4f} ({log_components})")
         
+            batch_iterator.set_postfix(loss=batch_total_loss.item(), **{k: f"{v:.4f}" for k,v in batch_loss_components.items()})
+
         avg_epoch_loss = epoch_total_loss / num_batches if num_batches > 0 else 0
         avg_loss_components = {k: v / num_batches if num_batches > 0 else 0 for k, v in epoch_loss_components_sum.items()}
         
@@ -416,9 +419,10 @@ class ArmatureMDMTrainer:
         epoch_total_loss = 0.0
         epoch_loss_components_sum: Dict[str, float] = {}
         num_batches = len(data_loader)
+        batch_iterator = tqdm(data_loader, desc=f"Validation Epoch Progress", total=num_batches, leave=True)
 
         with torch.no_grad():
-            for batch_idx, batch_data in enumerate(data_loader):
+            for batch_idx, batch_data in enumerate(batch_iterator):
                 batch_total_loss, batch_loss_components = self._run_batch(batch_data, is_training_model=False)
                 
                 if not torch.isnan(batch_total_loss): # Only add if not NaN
@@ -430,6 +434,11 @@ class ArmatureMDMTrainer:
                     log_components = ", ".join([f"{k}: {v:.4f}" for k,v in batch_loss_components.items()])
                     logger.debug(f"  Eval Batch {batch_idx+1}/{num_batches}, Total Loss: {batch_total_loss.item():.4f} ({log_components})")
         
+                if not torch.isnan(batch_total_loss):
+                    batch_iterator.set_postfix(loss=batch_total_loss.item(), **{k: f"{v:.4f}" for k,v in batch_loss_components.items()})
+                else:
+                    batch_iterator.set_postfix(loss='NaN')
+
         avg_epoch_loss = epoch_total_loss / num_batches if num_batches > 0 else 0
         avg_loss_components = {k: v / num_batches if num_batches > 0 else 0 for k, v in epoch_loss_components_sum.items()}
         return avg_epoch_loss, avg_loss_components
@@ -453,7 +462,7 @@ class ArmatureMDMTrainer:
         self._early_stopping_counter = 0
         self._best_val_loss = float('inf')
 
-        for epoch in range(1, num_epochs + 1):
+        for epoch in tqdm(range(1, num_epochs + 1), desc="Training Epoch", unit="epoch", leave=True):
             logger.info(f"--- Training Epoch {epoch}/{num_epochs} ---")
             avg_train_loss, avg_train_components = self.train_epoch(train_loader)
             log_train_components_str = ", ".join([f"Avg {k}: {v:.4f}" for k,v in avg_train_components.items()])
