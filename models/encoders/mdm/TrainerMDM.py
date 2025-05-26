@@ -232,8 +232,6 @@ class ArmatureMDMTrainer:
         # Logger warnings (unchanged)
         if not isinstance(self.model, ArmatureMDM):
             logger.warning("The provided model might not be an instance of the expected ArmatureMDM class.")
-        if not hasattr(self.model, 'sbert_model') or self.model.sbert_model is None:
-            logger.warning("SBERT model attribute not found or not loaded in ArmatureMDM.")
 
 
     def _calculate_masked_x0_loss(self,
