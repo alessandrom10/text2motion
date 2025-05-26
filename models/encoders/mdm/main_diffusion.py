@@ -60,9 +60,11 @@ def scan_and_pair_all_available_samples(
     if not os.path.isdir(text_dir_abs_path):
         logger.error(f"Text directory not found: {text_dir_abs_path}"); return []
 
-    # Expecting .npy files as per your data structure
     motion_filenames_with_ext = sorted([f for f in os.listdir(motion_dir_abs_path) if f.endswith(".npy")])
     logger.info(f"Found {len(motion_filenames_with_ext)} total .npy files in '{motion_dir_abs_path}'.")
+
+    processed_motion_files_count = 0
+    total_extracted_text_pairs_count = 0
 
     for motion_filename_ext in motion_filenames_with_ext:
         base_name = os.path.splitext(motion_filename_ext)[0]
@@ -71,22 +73,41 @@ def scan_and_pair_all_available_samples(
         
         if os.path.exists(text_file_path_abs):
             try:
+                num_descriptions_in_file = 0
                 with open(text_file_path_abs, 'r', encoding='utf-8') as f:
-                    text_prompt = f.read().strip()
-                if text_prompt:
-                    all_paired_samples_info.append({
-                        'motion_filename': motion_filename_ext,
-                        'text': text_prompt,
-                        'armature_id': default_armature_id
-                    })
+                    for line_number, line_content in enumerate(f):
+                        line_content_stripped = line_content.strip()
+                        if not line_content_stripped: # Skip empty lines
+                            continue
+
+                        parts = line_content_stripped.split('#')
+                        if not parts: # Should not happen if line_content_stripped is not empty
+                            logger.warning(f"Unexpected empty line content after strip in {text_file_path_abs}, line {line_number + 1}. Skipping.")
+                            continue
+                        
+                        natural_language_text = parts[0].strip()
+                        
+                        if natural_language_text:
+                            all_paired_samples_info.append({
+                                'motion_filename': motion_filename_ext, 
+                                'text': natural_language_text, # Only the natural language part
+                                'armature_id': default_armature_id
+                            })
+                            total_extracted_text_pairs_count += 1
+                            num_descriptions_in_file +=1
+                        else:
+                            logger.warning(f"Empty natural language text extracted from line {line_number + 1} in {text_file_path_abs}. Line: '{line_content_stripped[:100]}...'")
+                if num_descriptions_in_file > 0:
+                    processed_motion_files_count +=1
                 else:
-                    logger.warning(f"Empty text file: {text_file_path_abs} for motion {motion_filename_ext}. Skipping.")
+                    logger.warning(f"No valid descriptions found in {text_file_path_abs} for motion {motion_filename_ext}.")
+
             except Exception as e:
-                logger.warning(f"Could not read text file {text_file_path_abs}: {e}. Skipping.")
+                logger.warning(f"Could not read or parse text file {text_file_path_abs}: {e}. Skipping this motion file.")
         else:
             logger.warning(f"Matching text file not found for {motion_filename_ext} at {text_file_path_abs}. Skipping.")
     
-    logger.info(f"Successfully found {len(all_paired_samples_info)} paired motion/text samples.")
+    logger.info(f"Successfully processed {processed_motion_files_count} motion files, yielding {total_extracted_text_pairs_count} (motion_file, single_natural_language_description) pairs.")
     return all_paired_samples_info
 
 # --- Generate Annotation File from a LIST of samples ---
@@ -196,7 +217,7 @@ def run_training_pipeline(config: Dict[str, Any]) -> None:
             annotations_file_name=paths_config.get('annotations_file_name', 'annotations_train.csv'),
             motion_subdir=paths_config.get('motion_subdir', 'new_joints'),
             precomputed_sbert_embeddings_path=sbert_train_emb_path,
-            num_diffusion_timesteps=diffusion_params.get('num_diffusion_timesteps', 1000),
+            num_diffusion_timesteps=diffusion_params.get('num_diffusion_timesteps', 50),
             alphas_cumprod=alphas_cumprod,
             num_motion_features=model_hparams.get('num_motion_features', 66),
             motion_processor_fn=process_motion_file,

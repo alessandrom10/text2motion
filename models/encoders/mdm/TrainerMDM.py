@@ -403,8 +403,6 @@ class ArmatureMDMTrainer:
         avg_epoch_loss = epoch_total_loss / num_batches if num_batches > 0 else 0
         avg_loss_components = {k: v / num_batches if num_batches > 0 else 0 for k, v in epoch_loss_components_sum.items()}
         
-        if self.lr_scheduler:
-            self.lr_scheduler.step()
         return avg_epoch_loss, avg_loss_components
 
     def evaluate_epoch(self, data_loader: DataLoader) -> Tuple[float, Dict[str, float]]:
