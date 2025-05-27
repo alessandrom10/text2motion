@@ -892,14 +892,14 @@ class ArmatureMDMTrainer:
 
         for epoch in tqdm(range(1, num_epochs + 1), desc="Training Epoch", unit="epoch", leave=False): # leave=False for cleaner logs
             self.completed_epochs_count = epoch
-            logger.info(f"--- Training Epoch {epoch}/{num_epochs} ---")
+            #logger.info(f"--- Training Epoch {epoch}/{num_epochs} ---")
             avg_train_loss, avg_train_components = self.train_epoch(train_loader)
             log_train_components_str = ", ".join([f"Avg {k}: {v:.4f}" for k,v in avg_train_components.items()])
             logger.info(f"Epoch {epoch} Training Summary: Avg Total Loss: {avg_train_loss:.4f} ({log_train_components_str})")
             training_history['train_loss'].append(avg_train_loss)
 
             if val_loader:
-                logger.info(f"--- Validating Epoch {epoch}/{num_epochs} ---")
+                #logger.info(f"--- Validating Epoch {epoch}/{num_epochs} ---")
                 avg_val_loss, avg_val_components = self.evaluate_epoch(val_loader)
                 log_val_components_str = ", ".join([f"Avg {k}: {v:.4f}" for k,v in avg_val_components.items()])
                 logger.info(f"Epoch {epoch} Validation Summary: Avg Total Loss: {avg_val_loss:.4f} ({log_val_components_str})")
@@ -926,7 +926,7 @@ class ArmatureMDMTrainer:
                         logger.error(f"Error saving model: {e}")
                 else:
                     self._early_stopping_counter += 1
-                    logger.info(f"Validation loss did not improve significantly. Early stopping counter: {self._early_stopping_counter}/{self.early_stopping_patience}")
+                    #logger.info(f"Validation loss did not improve significantly. Early stopping counter: {self._early_stopping_counter}/{self.early_stopping_patience}")
                 if self._early_stopping_counter >= self.early_stopping_patience:
                     logger.info(f"Early stopping triggered at epoch {epoch}.")
                     break 
@@ -997,10 +997,10 @@ class ArmatureMDMTrainer:
         num_batches = len(data_loader)
         
         # Corrected tqdm description to use self.completed_epochs_count if available, or a generic message
-        current_epoch_display = self.completed_epochs_count if hasattr(self, 'completed_epochs_count') and self.completed_epochs_count > 0 else "Current"
-        batch_iterator = tqdm(data_loader, desc=f"Tr Ep {current_epoch_display}", total=num_batches, leave=True, ncols=None)
+        #current_epoch_display = self.completed_epochs_count if hasattr(self, 'completed_epochs_count') and self.completed_epochs_count > 0 else "Current"
+        #batch_iterator = tqdm(data_loader, desc=f"Tr Ep {current_epoch_display}", total=num_batches, leave=True, ncols=None)
 
-        for batch_idx, batch_data in enumerate(batch_iterator):
+        for batch_idx, batch_data in enumerate(data_loader):
             self.optimizer.zero_grad()
             batch_total_loss, batch_loss_components = self._run_batch(batch_data, is_training_model=True)
             
@@ -1016,13 +1016,15 @@ class ArmatureMDMTrainer:
             epoch_total_loss += batch_total_loss.item()
             for key, val in batch_loss_components.items():
                 epoch_loss_components_sum[key] = epoch_loss_components_sum.get(key, 0.0) + val
-
+            
+            '''
             if (batch_idx + 1) % max(1, num_batches // 10) == 0: # Log every 10%
                 log_components_str = ", ".join([f"{k}: {v:.4f}" for k,v in batch_loss_components.items()])
                 logger.info(f"  Batch {batch_idx+1}/{num_batches}, Total Loss: {batch_total_loss.item():.4f} ({log_components_str})")
         
             tqdm_postfix_short = self._get_tqdm_postfix_names(batch_loss_components)
             batch_iterator.set_postfix(loss=f"{batch_total_loss.item():.4f}", **tqdm_postfix_short)
+            '''
 
         avg_epoch_loss = epoch_total_loss / num_batches if num_batches > 0 else 0.0
         avg_loss_components = {k: v / num_batches if num_batches > 0 else 0.0 for k, v in epoch_loss_components_sum.items()}
@@ -1040,11 +1042,11 @@ class ArmatureMDMTrainer:
         epoch_loss_components_sum: Dict[str, float] = {}
         num_batches = len(data_loader)
 
-        current_epoch_display = self.completed_epochs_count if hasattr(self, 'completed_epochs_count') and self.completed_epochs_count > 0 else "Current"
-        batch_iterator = tqdm(data_loader, desc=f"Val Ep {current_epoch_display}", total=num_batches, leave=True, ncols=None)
+        #current_epoch_display = self.completed_epochs_count if hasattr(self, 'completed_epochs_count') and self.completed_epochs_count > 0 else "Current"
+        #batch_iterator = tqdm(data_loader, desc=f"Val Ep {current_epoch_display}", total=num_batches, leave=True, ncols=None)
 
         with torch.no_grad():
-            for batch_idx, batch_data in enumerate(batch_iterator):
+            for batch_idx, batch_data in enumerate(data_loader):
                 batch_total_loss, batch_loss_components = self._run_batch(batch_data, is_training_model=False)
                 
                 if not torch.isnan(batch_total_loss):
@@ -1052,10 +1054,14 @@ class ArmatureMDMTrainer:
                     for key, val in batch_loss_components.items():
                         epoch_loss_components_sum[key] = epoch_loss_components_sum.get(key, 0.0) + val
                 else:
+                    '''
                     tqdm_postfix_short = {"status": "NaN_loss"}
                     batch_iterator.set_postfix(loss="NaN", **tqdm_postfix_short)
+                    '''
+                    logger.warning(f"NaN loss detected during validation at batch {batch_idx} in epoch {epoch_num}.")
                     continue
-
+                    
+                '''
                 if (batch_idx + 1) % max(1, num_batches // 10) == 0:
                     log_components_str = ", ".join([f"{k}: {v:.4f}" for k,v in batch_loss_components.items()])
                     logger.debug(f"  Eval Batch {batch_idx+1}/{num_batches}, Total Loss: {batch_total_loss.item():.4f} ({log_components_str})")
@@ -1063,6 +1069,7 @@ class ArmatureMDMTrainer:
                 if not torch.isnan(batch_total_loss):
                     tqdm_postfix_short = self._get_tqdm_postfix_names(batch_loss_components)
                     batch_iterator.set_postfix(loss=f"{batch_total_loss.item():.4f}", **tqdm_postfix_short)
+                '''
 
         avg_epoch_loss = epoch_total_loss / num_batches if num_batches > 0 else 0.0
         avg_loss_components = {k: v / num_batches if num_batches > 0 else 0.0 for k, v in epoch_loss_components_sum.items()}
