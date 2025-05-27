@@ -82,7 +82,8 @@ class MDMGeometricLosses(nn.Module):
                        target_x0: torch.Tensor,    # Shape: [bs, num_frames, num_total_features]
                        # foot_contact_gt: Shape [bs, num_frames, num_joints], binary 1 for contact
                        foot_contact_gt: Optional[torch.Tensor] = None, 
-                       armature_class_ids: Optional[torch.Tensor] = None # For get_bone_mask_fn
+                       armature_class_ids: Optional[torch.Tensor] = None, # For get_bone_mask_fn
+                       armature_config_data: Optional[Dict] = None
                       ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
         Computes the weighted sum of geometric losses.
@@ -92,6 +93,7 @@ class MDMGeometricLosses(nn.Module):
         :param foot_contact_gt: Ground truth binary foot contact mask (1 for contact, 0 for air).
                                  Shape: [bs, num_frames, num_joints]. Required if lambda_foot > 0.
         :param armature_class_ids: Tensor of armature class IDs for applying get_bone_mask_fn.
+        :param armature_config_data: Optional configuration data for the armature (e.g., bone names, joint indices).
         :return: Tuple (total_weighted_geometric_loss, dictionary_of_individual_losses).
         """
         bs, num_frames, num_total_features = predicted_x0.shape
@@ -109,7 +111,11 @@ class MDMGeometricLosses(nn.Module):
         overall_bone_mask = None
         if self.get_bone_mask_fn is not None and armature_class_ids is not None:
             overall_bone_mask = self.get_bone_mask_fn(
-                armature_class_ids, num_total_features, num_frames, str(self.device)
+                armature_class_ids, 
+                num_total_features, 
+                num_frames, 
+                str(self.device),
+                armature_config_data=armature_config_data
             ) # Shape: [bs, num_frames, num_total_features]
 
 
@@ -126,7 +132,7 @@ class MDMGeometricLosses(nn.Module):
                 num_active = torch.tensor(pos_loss_elementwise.numel(), device=self.device)
 
             l_pos = pos_loss_elementwise.sum() / (num_active + 1e-8) if num_active > 0 else torch.tensor(0.0, device=self.device)
-            total_geometric_loss += self.lambda_pos * l_pos
+            total_geometric_loss = total_geometric_loss + self.lambda_pos * l_pos
             losses['geom_pos_loss'] = l_pos.item()
 
         # 2. L_vel (Velocity Loss)
@@ -147,7 +153,7 @@ class MDMGeometricLosses(nn.Module):
                     num_active = torch.tensor(vel_loss_elementwise.numel(), device=self.device)
 
                 l_vel = vel_loss_elementwise.sum() / (num_active + 1e-8) if num_active > 0 else torch.tensor(0.0, device=self.device)
-                total_geometric_loss += self.lambda_vel * l_vel
+                total_geometric_loss = total_geometric_loss + self.lambda_vel * l_vel
                 losses['geom_vel_loss'] = l_vel.item()
 
         # 3. L_foot (Foot Contact Loss)
@@ -214,7 +220,7 @@ class MDMGeometricLosses(nn.Module):
                     num_active = active_foot_contact.sum()
 
                 l_foot = l_foot_elementwise.sum() / (num_active + 1e-8) if num_active > 0 else torch.tensor(0.0, device=self.device)
-                total_geometric_loss += self.lambda_foot * l_foot
+                total_geometric_loss = total_geometric_loss + self.lambda_foot * l_foot
                 losses['geom_foot_loss'] = l_foot.item()
         
         if hasattr(total_geometric_loss, 'requires_grad') and predicted_x0.requires_grad and not total_geometric_loss.requires_grad and total_geometric_loss == 0.0:
@@ -314,7 +320,8 @@ class KinematicLossCalculator:
                        target_x0: torch.Tensor, # Ground truth clean motion (for target derivatives)
                        scheduler_params: Dict[str, torch.Tensor],
                        armature_class_ids: torch.Tensor,
-                       is_training_model: bool 
+                       is_training_model: bool,
+                       armature_config_data: Optional[Dict] = None
                     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
         Computes kinematic losses (velocity, acceleration) directly on the predicted_x0_from_model.
@@ -326,6 +333,7 @@ class KinematicLossCalculator:
         :param scheduler_params: Scheduler parameters (may be less relevant now).
         :param armature_class_ids: Tensor of armature class IDs for the batch.
         :param is_training_model: Boolean indicating if the model is in training mode.
+        :param armature_config_data: Optional configuration data for the armature (e.g., bone names, joint indices).
         :return: Tuple (total_kinematic_loss, losses_dict).
         """
         if not (self.use_velocity_loss or self.use_acceleration_loss):
@@ -340,7 +348,11 @@ class KinematicLossCalculator:
 
         # The bone_mask should correspond to the full x0 sequence length
         bone_mask_for_x0_derivatives = self.get_bone_mask_fn(
-            armature_class_ids, num_total_motion_features, num_frames_x0, self.device
+            armature_class_ids, 
+            num_total_motion_features, 
+            num_frames_x0, 
+            self.device,
+            armature_config_data=armature_config_data
         )
 
         total_kin_loss = torch.tensor(0.0, device=self.device) # requires_grad will propagate
@@ -357,7 +369,7 @@ class KinematicLossCalculator:
                 # Mask for velocity is for a sequence of length num_frames_x0 - 1
                 bone_mask_vel = bone_mask_for_x0_derivatives[:, :pred_vel.shape[1], :]
                 vel_loss = self._calculate_masked_feature_loss(pred_vel, target_vel, bone_mask_vel)
-                total_kin_loss += self.velocity_loss_weight * vel_loss
+                total_kin_loss = total_kin_loss + self.velocity_loss_weight * vel_loss
                 losses_dict['velocity_loss'] = vel_loss.item()
 
         # --- Acceleration Loss ---
@@ -380,16 +392,16 @@ class KinematicLossCalculator:
                     # Mask for acceleration is for a sequence of length num_frames_x0 - 2
                     bone_mask_accel = bone_mask_for_x0_derivatives[:, :pred_accel.shape[1], :]
                     accel_loss = self._calculate_masked_feature_loss(pred_accel, target_accel, bone_mask_accel)
-                    total_kin_loss += self.acceleration_loss_weight * accel_loss
+                    total_kin_loss = total_kin_loss + self.acceleration_loss_weight * accel_loss
                     losses_dict['acceleration_loss'] = accel_loss.item()
 
         # Ensure requires_grad is properly set for the total_kin_loss if it's zero
         # and the model is in training mode (so backpropagation doesn't break if this is the only loss)
         if is_training_model and not total_kin_loss.requires_grad and total_kin_loss.is_leaf :
-             # If total_kin_loss is a zero scalar and it's a leaf, clone and set requires_grad
-             # This can happen if all weightings are zero or all sub-losses are zero.
-             if total_kin_loss == 0.0:
-                 total_kin_loss = total_kin_loss.clone().requires_grad_(True)
+            # If total_kin_loss is a zero scalar and it's a leaf, clone and set requires_grad
+            # This can happen if all weightings are zero or all sub-losses are zero.
+            if total_kin_loss == 0.0:
+                total_kin_loss = total_kin_loss.clone().requires_grad_(True)
 
         return total_kin_loss, losses_dict
 
@@ -576,9 +588,10 @@ class ArmatureMDMTrainer:
                 target_x0=target_x0_for_main_loss,    # Ground truth clean motion
                 scheduler_params=scheduler_params_for_kin_calc, # Pass if still used by kin_calc
                 armature_class_ids=armature_class_ids,
-                is_training_model=is_training_model 
+                is_training_model=is_training_model,
+                armature_config_data=self.armature_config_data
             )
-            current_total_loss += kin_loss
+            current_total_loss = current_total_loss + kin_loss
             loss_components.update(kin_losses_dict)
 
         # --- Optional MDM Geometric Losses ---
@@ -591,9 +604,10 @@ class ArmatureMDMTrainer:
                 predicted_x0=predicted_x0,
                 target_x0=target_x0_for_main_loss,
                 foot_contact_gt=foot_contact_gt,
-                armature_class_ids=armature_class_ids
+                armature_class_ids=armature_class_ids,
+                armature_config_data=self.armature_config_data,
             )
-            current_total_loss += mdm_geom_loss
+            current_total_loss = current_total_loss + mdm_geom_loss
             loss_components.update(mdm_geom_losses_dict)
 
         return current_total_loss, loss_components

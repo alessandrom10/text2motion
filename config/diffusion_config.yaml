@@ -57,16 +57,16 @@ early_stopping:
   early_stopping_min_delta: 0.0001
       
 kinematic_losses:
-  use_kinematic_losses: false
-  velocity_loss_weight: 0.0
-  acceleration_loss_weight: 0.0
+  use_kinematic_losses: true
+  velocity_loss_weight: 0.1
+  acceleration_loss_weight: 0.1
   kinematic_loss_type: "l1"
 
 # Geometric Losses
 mdm_geometric_losses:
-  use_mdm_geometric_losses: false # Set to true to enable these losses
-  lambda_pos: 0.0     # Weight for position loss (L_pos). 
-  lambda_vel: 0.0     # Weight for velocity loss (L_vel). Set > 0 to use.
+  use_mdm_geometric_losses: true # Set to true to enable these losses
+  lambda_pos: 0.1     # Weight for position loss (L_pos). 
+  lambda_vel: 0.5     # Weight for velocity loss (L_vel). Set > 0 to use.
   lambda_foot: 0.0    # Weight for foot contact loss (L_foot). Set > 0 to use.
   foot_joint_indices: [10, 11] # Example: Indices for Left Foot and Right Foot
 
