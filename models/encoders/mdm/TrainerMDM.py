@@ -1,4 +1,5 @@
 import os
+from sentence_transformers import SentenceTransformer
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -8,6 +9,7 @@ from typing import Dict, Any, Callable, List, Literal, Optional, Tuple
 import logging
 from tqdm.auto import tqdm
 from ArmatureMDM import ArmatureMDM
+from utils.diffusion_utils import T2M_KINEMATIC_CHAIN, create_motion_animation
 
 logger = logging.getLogger(__name__)
 
@@ -490,6 +492,152 @@ class ArmatureMDMTrainer:
         self._best_val_loss = float('inf')
         self.completed_epochs_count = 0
 
+        # Parameters for generating samples during training
+        self.generate_sample_every_n_epochs = training_hyperparams_cfg.get('generate_sample_every_n_epochs', 0) # Default 0 to disable
+        if self.generate_sample_every_n_epochs > 0:
+            self.sample_generation_prompt = training_hyperparams_cfg.get('sample_generation_prompt', "a person walks")
+            self.sample_generation_armature_id = training_hyperparams_cfg.get('sample_generation_armature_id', 1)
+            self.sample_generation_num_frames = training_hyperparams_cfg.get('sample_generation_num_frames', 100)
+            self.sample_generation_cfg_scale = training_hyperparams_cfg.get('sample_generation_cfg_scale', 2.5)
+            
+            # Determine where to save generated sample GIFs
+            model_save_dir = config.get('paths', {}).get('model_save_dir', './trained_models_output/')
+            self.sample_generation_output_dir = training_hyperparams_cfg.get('sample_generation_output_dir', model_save_dir)
+            if not os.path.isabs(self.sample_generation_output_dir):
+                 # If project_root is available and path is relative, make it absolute from project_root
+                 # This depends on how project_root is defined/accessible here.
+                 # For simplicity, let's assume it will be created relative to where script is run or use model_save_dir
+                 pass
+            os.makedirs(self.sample_generation_output_dir, exist_ok=True)
+
+            # SBERT model for generating samples (load once)
+            sbert_model_name_cfg = config.get('model_hyperparameters', {}).get('sbert_model_name')
+            if sbert_model_name_cfg:
+                 logger.info(f"Initializing SBERT model ({sbert_model_name_cfg}) for sample generation during training...")
+                 self.sbert_processor_for_sampling = SentenceTransformer(sbert_model_name_cfg, device=self.device)
+            else:
+                 logger.warning("SBERT model name not found in config, cannot generate samples during training.")
+                 self.generate_sample_every_n_epochs = 0 # Disable if no SBERT model
+        
+        logger.info(f"ArmatureMDMTrainer initialized. Will generate samples every {self.generate_sample_every_n_epochs} epochs.")
+
+    @torch.no_grad()
+    def _generate_sample_for_inspection(self, epoch_num: int) -> Optional[torch.Tensor]:
+        """
+        Internal helper to generate a single motion sample for visual inspection.
+        This replicates parts of the standalone generation script logic.
+        """
+        if not hasattr(self, 'sbert_processor_for_sampling') or self.sbert_processor_for_sampling is None:
+            logger.warning("SBERT processor for sampling not initialized. Skipping sample generation.")
+            return None
+
+        logger.info(f"Generating inspection sample for epoch {epoch_num}...")
+        self.model.eval() # Set model to evaluation mode
+
+        # Get necessary hyperparameters from the stored config
+        model_hyperparams = self.config.get('model_hyperparameters', {})
+        diffusion_hyperparams = self.config.get('diffusion_hyperparameters', {})
+
+        num_motion_features = model_hyperparams.get('num_motion_features', 66)
+        
+        try:
+            text_embedding = self.sbert_processor_for_sampling.encode(
+                self.sample_generation_prompt, convert_to_tensor=True
+            ).unsqueeze(0).to(self.device)
+        except Exception as e:
+            logger.error(f"Error encoding text for sample generation: {e}")
+            return None
+
+        armature_class_ids_tensor = torch.tensor([self.sample_generation_armature_id], device=self.device, dtype=torch.long)
+
+        num_diffusion_timesteps = diffusion_hyperparams.get('num_diffusion_timesteps', 100)
+        beta_start = diffusion_hyperparams.get('beta_start', 0.0001)
+        beta_end = diffusion_hyperparams.get('beta_end', 0.02)
+
+        betas = torch.linspace(beta_start, beta_end, num_diffusion_timesteps, dtype=torch.float32, device=self.device)
+        alphas = 1.0 - betas
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
+        alphas_cumprod_prev = torch.cat([torch.tensor([1.0], device=self.device), alphas_cumprod[:-1]], dim=0)
+        
+        posterior_variance = (1.0 - alphas_cumprod_prev) * betas / (1.0 - alphas_cumprod + 1e-9)
+        posterior_log_variance_clipped = torch.log(torch.clamp(posterior_variance, min=1e-20))
+        posterior_mean_coef1 = torch.sqrt(alphas_cumprod_prev) * betas / (1.0 - alphas_cumprod + 1e-9)
+        posterior_mean_coef2 = torch.sqrt(alphas) * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod + 1e-9)
+
+        current_xt = torch.randn((1, self.sample_generation_num_frames, num_motion_features), device=self.device)
+
+        for t_idx in tqdm(reversed(range(num_diffusion_timesteps)), desc="Generating Sample", total=num_diffusion_timesteps, leave=False):
+            timesteps_batch = torch.full((1,), t_idx, device=self.device, dtype=torch.long)
+            predicted_x0_cond = self.model(current_xt, timesteps_batch, text_embedding, armature_class_ids_tensor, uncond_text=False, uncond_armature=False)
+            predicted_x0_uncond = self.model(current_xt, timesteps_batch, text_embedding, armature_class_ids_tensor, uncond_text=True, uncond_armature=True)
+            final_predicted_x0 = predicted_x0_uncond + self.sample_generation_cfg_scale * (predicted_x0_cond - predicted_x0_uncond)
+
+            if t_idx == 0:
+                current_xt = final_predicted_x0
+            else:
+                current_posterior_mean_coef1 = posterior_mean_coef1[t_idx]
+                current_posterior_mean_coef2 = posterior_mean_coef2[t_idx]
+                posterior_mean = current_posterior_mean_coef1 * final_predicted_x0 + current_posterior_mean_coef2 * current_xt
+                noise_for_sampling = torch.randn_like(current_xt)
+                current_xt = posterior_mean + (0.5 * posterior_log_variance_clipped[t_idx]).exp() * noise_for_sampling
+        
+        self.model.train() # Return model to training mode
+        logger.info(f"Inspection sample generation complete for epoch {epoch_num}.")
+        return current_xt # Shape: [1, num_frames, num_motion_features]
+
+    def _save_and_animate_sample(self, motion_tensor: torch.Tensor, epoch_num: int):
+        """
+        Prepares motion data and calls the animation utility.
+        """
+        if motion_tensor is None:
+            return
+
+        logger.info(f"Preparing animation for epoch {epoch_num} sample...")
+        motion_to_animate_np = motion_tensor.squeeze(0).cpu().numpy()
+        
+        model_hyperparams = self.config.get('model_hyperparameters', {})
+        num_joints_for_viz = model_hyperparams.get('num_joints_for_geom', 22)
+        features_per_joint_viz = model_hyperparams.get('features_per_joint_for_geom', 3)
+
+        if motion_to_animate_np.shape[1] != num_joints_for_viz * features_per_joint_viz:
+            logger.error(f"Generated sample motion features ({motion_to_animate_np.shape[1]}) mismatch. Cannot reshape for animation.")
+            return
+        
+        try:
+            motion_reshaped = motion_to_animate_np.reshape(
+                (self.sample_generation_num_frames, num_joints_for_viz, features_per_joint_viz)
+            )
+        except ValueError as e:
+            logger.error(f"Error reshaping sample motion data for animation: {e}.")
+            return
+
+        motion_centered = motion_reshaped - motion_reshaped[:, 0:1, :]
+        
+        # UNIT_CONVERSION: Adjust based on your model's output scale.
+        # If model output is mm-scale, use 1.0/1000.0. If meter-scale/normalized, use None or 1.0.
+        unit_conversion = 1.0 / 1000.0 if model_hyperparams.get("output_scale_is_mm", False) else None # Example: add "output_scale_is_mm" to config
+
+        # Ensure the output directory for samples exists
+        # self.sample_generation_output_dir is defined in __init__
+        # It uses model_save_dir from paths_config as a fallback if not specified in training_hyperparams
+        
+        run_name = self.config.get('run_name', 'default_run')
+        animation_filename = f"{run_name}_epoch{epoch_num}_arm{self.sample_generation_armature_id}.gif"
+        animation_output_path = os.path.join(self.sample_generation_output_dir, animation_filename)
+
+        logger.info(f"Creating sample animation: {animation_output_path}")
+        try:
+            create_motion_animation( # This function is from utils.diffusion_utils
+                motion_data_frames=motion_centered,
+                kinematic_chain=T2M_KINEMATIC_CHAIN, 
+                output_filename=animation_output_path,
+                fps=30,
+                unit_conversion_factor=unit_conversion,
+                y_z_swap=True
+            )
+        except Exception as e:
+            logger.error(f"Failed to create or save sample animation for epoch {epoch_num}: {e}")
+
 
     def _get_timestep_loss_weights(self, timesteps: torch.Tensor) -> torch.Tensor:
         """
@@ -808,7 +956,15 @@ class ArmatureMDMTrainer:
                 if hasattr(self.optimizer, 'param_groups'):
                      current_lr = self.optimizer.param_groups[0]['lr']
                      logger.info(f"Current learning rate: {current_lr:.6e}")
-        
+
+            if self.generate_sample_every_n_epochs > 0 and \
+               epoch % self.generate_sample_every_n_epochs == 0:
+                current_model_training_state = self.model.training # Save current state
+                generated_sample_tensor = self._generate_sample_for_inspection(epoch_num=epoch)
+                if generated_sample_tensor is not None:
+                    self._save_and_animate_sample(generated_sample_tensor, epoch_num=epoch)
+                self.model.train(current_model_training_state)
+                    
         logger.info(f"ArmatureMDM training finished after {self.completed_epochs_count} epochs.")
         if not val_loader and self.completed_epochs_count == num_epochs : # Only save final if full epochs run without validation
             logger.info(f"Saving final model (trained for {num_epochs} epochs without validation-based early stopping)...")
