@@ -44,12 +44,18 @@ model_hyperparameters:
 training_hyperparameters:
   batch_size: 32
   num_epochs: 50
-  learning_rate: 0.001
-  cfg_drop_prob_trainer: 0.1
+  learning_rate: 0.0005
+  cfg_drop_prob_trainer: 0.2
   device: "cuda"
   use_lr_scheduler: true
   lr_scheduler_factor: 0.5
   main_loss_type_trainer: "mse"
+
+# Configuration for the main x0 loss, including timestep weighting
+main_x0_loss_config: # New or renamed section
+  timestep_weighting:
+    scheme: "snr_plus_one"  # Options: "none", "snr_plus_one", "inv_sigma_squared", "min_snr_gamma"
+    min_snr_gamma_value: 5.0
 
 
 early_stopping:
@@ -57,7 +63,7 @@ early_stopping:
   early_stopping_min_delta: 0.0001
       
 kinematic_losses:
-  use_kinematic_losses: true
+  use_kinematic_losses: false
   velocity_loss_weight: 0.1
   acceleration_loss_weight: 0.1
   kinematic_loss_type: "l1"
