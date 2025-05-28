@@ -355,14 +355,12 @@ def run_training_pipeline(config: Dict[str, Any]) -> None:
         model=model, 
         optimizer=optimizer, 
         get_bone_mask_fn=get_bone_mask_for_armature,
+        config=config,
         armature_config_data=loaded_armature_config_data,
-        device=str(device), lr_scheduler=lr_scheduler,
-        main_loss_type=training_hparams.get('main_loss_type', "mse"),
-        cfg_drop_prob=training_hparams.get('cfg_drop_prob_trainer', 0.1),
+        device=str(device), 
+        lr_scheduler=lr_scheduler,
         kinematic_loss_calculator=kinematic_calculator,
         mdm_geometric_loss_calculator=mdm_geom_loss_calc,
-        early_stopping_patience=early_stopping_params.get('patience', 10),
-        early_stopping_min_delta=early_stopping_params.get('min_delta', 0.0001),
         model_save_path=os.path.join(model_save_dir, paths_config.get('model_filename', 'model.pth'))
     )
 
@@ -372,7 +370,7 @@ def run_training_pipeline(config: Dict[str, Any]) -> None:
     
     history = trainer.train( 
         train_loader=train_loader,
-        num_epochs=num_epochs_to_run,
+        num_epochs=training_hparams.get('num_epochs', 50),
         val_loader=val_loader
     )
 

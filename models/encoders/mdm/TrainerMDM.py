@@ -1,3 +1,5 @@
+import os
+from sentence_transformers import SentenceTransformer
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -7,6 +9,7 @@ from typing import Dict, Any, Callable, List, Literal, Optional, Tuple
 import logging
 from tqdm.auto import tqdm
 from ArmatureMDM import ArmatureMDM
+from utils.diffusion_utils import T2M_KINEMATIC_CHAIN, create_motion_animation
 
 logger = logging.getLogger(__name__)
 
@@ -416,32 +419,26 @@ class ArmatureMDMTrainer:
     def __init__(self,
                     model: ArmatureMDM,
                     optimizer: optim.Optimizer,
-                    get_bone_mask_fn: Callable[[torch.Tensor, int, int, str], torch.Tensor],
+                    get_bone_mask_fn: Callable[..., torch.Tensor],
+                    config: Dict[str, Any],
                     armature_config_data: Optional[Dict] = None,
                     device: str = "cuda" if torch.cuda.is_available() else "cpu",
                     lr_scheduler: Optional[Any] = None,
-                    main_loss_type: Literal["l1", "mse"] = "mse",  # for x0 prediction.
-                    cfg_drop_prob: float = 0.1, # Probability of dropping conditions for CFG training
-                    kinematic_loss_calculator: Optional[KinematicLossCalculator] = None,
+                    kinematic_loss_calculator: Optional[Any] = None,
                     mdm_geometric_loss_calculator: Optional[Any] = None,
-                    early_stopping_patience: int = 10,
-                    early_stopping_min_delta: float = 0.01,
-                    model_save_path: Optional[str] = 'armature_mdm_best_model.pth'  # Path to save the best model
+                    model_save_path: Optional[str] = 'armature_mdm_best_model.pth'
                 ):
         """
-        Initializes the ArmatureMDMTrainer with the model, optimizer, and other parameters.
-        :param model: Instance of ArmatureMDM model.
+        Initializes the ArmatureMDMTrainer with the model, optimizer, and configuration.
+        :param model: The ArmatureMDM model to be trained.
         :param optimizer: Optimizer for training the model.
-        :param get_bone_mask_fn: Function to get bone mask for active features.
+        :param get_bone_mask_fn: Function to get the bone mask for active features.
+        :param config: Full configuration dictionary containing training hyperparameters, loss settings, etc.
         :param armature_config_data: Optional configuration data for the armature (e.g., bone names, joint indices).
-        :param device: Device to run the model on (default: "cuda" if available).
-        :param lr_scheduler: Optional learning rate scheduler.
-        :param main_loss_type: Type of loss for x0 prediction ('l1' or 'mse').
-        :param cfg_drop_prob: Probability of dropping conditions for CFG training.
-        :param kinematic_loss_calculator: Optional KinematicLossCalculator instance for kinematic losses.
-        :param mdm_geometric_loss_calculator: Optional MDMGeometricLosses instance for geometric losses.
-        :param early_stopping_patience: Number of epochs with no improvement after which training will be stopped.
-        :param early_stopping_min_delta: Minimum change in the monitored quantity to qualify as an improvement.
+        :param device: Device to run the training on (e.g., "cuda" or "cpu").
+        :param lr_scheduler: Optional learning rate scheduler for the optimizer.
+        :param kinematic_loss_calculator: Optional instance of KinematicLossCalculator for computing kinematic losses.
+        :param mdm_geometric_loss_calculator: Optional instance of MDMGeometricLosses for computing geometric losses.
         :param model_save_path: Path to save the best model during training.
         """
         self.model = model.to(device)
@@ -450,36 +447,248 @@ class ArmatureMDMTrainer:
         self.armature_config_data = armature_config_data
         self.device = device
         self.lr_scheduler = lr_scheduler
-        self.main_loss_type = main_loss_type
-        self.cfg_drop_prob = cfg_drop_prob
+        self.config = config # Store the full config
+
+        training_hyperparams_cfg = config.get('training_hyperparameters', {})
+        self.main_loss_type = training_hyperparams_cfg.get('main_loss_type_trainer', "mse")
+        self.cfg_drop_prob = training_hyperparams_cfg.get('cfg_drop_prob_trainer', 0.1)
+
+        # Timestep loss weighting configuration
+        main_x0_loss_cfg = config.get('main_x0_loss_config', {})
+        self.loss_weighting_config = main_x0_loss_cfg.get('timestep_weighting', {'scheme': 'none'})
+        self.loss_weighting_scheme = self.loss_weighting_config.get('scheme', 'none')
+        self.min_snr_gamma_value = self.loss_weighting_config.get('min_snr_gamma_value', 5.0)
+
+        # Noise schedule parameters for loss weighting
+        diffusion_hyperparams_cfg = config.get('diffusion_hyperparameters', {})
+        self.num_diffusion_timesteps = diffusion_hyperparams_cfg.get('num_diffusion_timesteps', 1000)
+
+        if self.loss_weighting_scheme != "none":
+            beta_start = diffusion_hyperparams_cfg.get('beta_start', 0.0001)
+            beta_end = diffusion_hyperparams_cfg.get('beta_end', 0.02)
+            # Generate alphas_cumprod on the trainer's device
+            betas = torch.linspace(beta_start, beta_end, self.num_diffusion_timesteps,
+                                   dtype=torch.float32, device=self.device)
+            alphas = 1.0 - betas
+            self.alphas_cumprod_trainer = torch.cumprod(alphas, axis=0) # Shape [T]
+
+            if self.loss_weighting_scheme in ["snr_plus_one", "min_snr_gamma"]:
+                self.snr_values = self.alphas_cumprod_trainer / (1.0 - self.alphas_cumprod_trainer + 1e-8) # Shape [T]
+        
+        logger.info(f"ArmatureMDMTrainer initialized. Main loss type: {self.main_loss_type}")
+        logger.info(f"Timestep loss weighting scheme: '{self.loss_weighting_scheme}'")
+        if self.loss_weighting_scheme == "min_snr_gamma":
+            logger.info(f" -> min_snr_gamma_value: {self.min_snr_gamma_value}")
+
         self.kinematic_loss_calculator = kinematic_loss_calculator
         self.mdm_geometric_loss_calculator = mdm_geometric_loss_calculator
-
-        self.early_stopping_patience = early_stopping_patience
-        self.early_stopping_min_delta = early_stopping_min_delta
+        
+        early_stopping_cfg = config.get('early_stopping', {})
+        self.early_stopping_patience = early_stopping_cfg.get('early_stopping_patience', 10)
+        self.early_stopping_min_delta = early_stopping_cfg.get('early_stopping_min_delta', 0.0001)
         self.model_save_path = model_save_path
         
         self._early_stopping_counter = 0
         self._best_val_loss = float('inf')
+        self.completed_epochs_count = 0
 
-        # Logger warnings (unchanged)
-        if not isinstance(self.model, ArmatureMDM):
-            logger.warning("The provided model might not be an instance of the expected ArmatureMDM class.")
+        # Parameters for generating samples during training
+        self.generate_sample_every_n_epochs = training_hyperparams_cfg.get('generate_sample_every_n_epochs', 0) # Default 0 to disable
+        if self.generate_sample_every_n_epochs > 0:
+            self.sample_generation_prompt = training_hyperparams_cfg.get('sample_generation_prompt', "a person walks")
+            self.sample_generation_armature_id = training_hyperparams_cfg.get('sample_generation_armature_id', 1)
+            self.sample_generation_num_frames = training_hyperparams_cfg.get('sample_generation_num_frames', 100)
+            self.sample_generation_cfg_scale = training_hyperparams_cfg.get('sample_generation_cfg_scale', 2.5)
+            
+            # Determine where to save generated sample GIFs
+            model_save_dir = config.get('paths', {}).get('model_save_dir', './trained_models_output/')
+            self.sample_generation_output_dir = training_hyperparams_cfg.get('sample_generation_output_dir', model_save_dir)
+            if not os.path.isabs(self.sample_generation_output_dir):
+                 # If project_root is available and path is relative, make it absolute from project_root
+                 # This depends on how project_root is defined/accessible here.
+                 # For simplicity, let's assume it will be created relative to where script is run or use model_save_dir
+                 pass
+            os.makedirs(self.sample_generation_output_dir, exist_ok=True)
 
+            # SBERT model for generating samples (load once)
+            sbert_model_name_cfg = config.get('model_hyperparameters', {}).get('sbert_model_name')
+            if sbert_model_name_cfg:
+                 logger.info(f"Initializing SBERT model ({sbert_model_name_cfg}) for sample generation during training...")
+                 self.sbert_processor_for_sampling = SentenceTransformer(sbert_model_name_cfg, device=self.device)
+            else:
+                 logger.warning("SBERT model name not found in config, cannot generate samples during training.")
+                 self.generate_sample_every_n_epochs = 0 # Disable if no SBERT model
+        
+        logger.info(f"ArmatureMDMTrainer initialized. Will generate samples every {self.generate_sample_every_n_epochs} epochs.")
+
+    @torch.no_grad()
+    def _generate_sample_for_inspection(self, epoch_num: int) -> Optional[torch.Tensor]:
+        """
+        Internal helper to generate a single motion sample for visual inspection.
+        This replicates parts of the standalone generation script logic.
+        """
+        if not hasattr(self, 'sbert_processor_for_sampling') or self.sbert_processor_for_sampling is None:
+            logger.warning("SBERT processor for sampling not initialized. Skipping sample generation.")
+            return None
+
+        logger.info(f"Generating inspection sample for epoch {epoch_num}...")
+        self.model.eval() # Set model to evaluation mode
+
+        # Get necessary hyperparameters from the stored config
+        model_hyperparams = self.config.get('model_hyperparameters', {})
+        diffusion_hyperparams = self.config.get('diffusion_hyperparameters', {})
+
+        num_motion_features = model_hyperparams.get('num_motion_features', 66)
+        
+        try:
+            text_embedding = self.sbert_processor_for_sampling.encode(
+                self.sample_generation_prompt, convert_to_tensor=True
+            ).unsqueeze(0).to(self.device)
+        except Exception as e:
+            logger.error(f"Error encoding text for sample generation: {e}")
+            return None
+
+        armature_class_ids_tensor = torch.tensor([self.sample_generation_armature_id], device=self.device, dtype=torch.long)
+
+        num_diffusion_timesteps = diffusion_hyperparams.get('num_diffusion_timesteps', 100)
+        beta_start = diffusion_hyperparams.get('beta_start', 0.0001)
+        beta_end = diffusion_hyperparams.get('beta_end', 0.02)
+
+        betas = torch.linspace(beta_start, beta_end, num_diffusion_timesteps, dtype=torch.float32, device=self.device)
+        alphas = 1.0 - betas
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
+        alphas_cumprod_prev = torch.cat([torch.tensor([1.0], device=self.device), alphas_cumprod[:-1]], dim=0)
+        
+        posterior_variance = (1.0 - alphas_cumprod_prev) * betas / (1.0 - alphas_cumprod + 1e-9)
+        posterior_log_variance_clipped = torch.log(torch.clamp(posterior_variance, min=1e-20))
+        posterior_mean_coef1 = torch.sqrt(alphas_cumprod_prev) * betas / (1.0 - alphas_cumprod + 1e-9)
+        posterior_mean_coef2 = torch.sqrt(alphas) * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod + 1e-9)
+
+        current_xt = torch.randn((1, self.sample_generation_num_frames, num_motion_features), device=self.device)
+
+        for t_idx in tqdm(reversed(range(num_diffusion_timesteps)), desc="Generating Sample", total=num_diffusion_timesteps, leave=False):
+            timesteps_batch = torch.full((1,), t_idx, device=self.device, dtype=torch.long)
+            predicted_x0_cond = self.model(current_xt, timesteps_batch, text_embedding, armature_class_ids_tensor, uncond_text=False, uncond_armature=False)
+            predicted_x0_uncond = self.model(current_xt, timesteps_batch, text_embedding, armature_class_ids_tensor, uncond_text=True, uncond_armature=True)
+            final_predicted_x0 = predicted_x0_uncond + self.sample_generation_cfg_scale * (predicted_x0_cond - predicted_x0_uncond)
+
+            if t_idx == 0:
+                current_xt = final_predicted_x0
+            else:
+                current_posterior_mean_coef1 = posterior_mean_coef1[t_idx]
+                current_posterior_mean_coef2 = posterior_mean_coef2[t_idx]
+                posterior_mean = current_posterior_mean_coef1 * final_predicted_x0 + current_posterior_mean_coef2 * current_xt
+                noise_for_sampling = torch.randn_like(current_xt)
+                current_xt = posterior_mean + (0.5 * posterior_log_variance_clipped[t_idx]).exp() * noise_for_sampling
+        
+        self.model.train() # Return model to training mode
+        logger.info(f"Inspection sample generation complete for epoch {epoch_num}.")
+        return current_xt # Shape: [1, num_frames, num_motion_features]
+
+    def _save_and_animate_sample(self, motion_tensor: torch.Tensor, epoch_num: int):
+        """
+        Prepares motion data and calls the animation utility.
+        """
+        if motion_tensor is None:
+            return
+
+        logger.info(f"Preparing animation for epoch {epoch_num} sample...")
+        motion_to_animate_np = motion_tensor.squeeze(0).cpu().numpy()
+        
+        model_hyperparams = self.config.get('model_hyperparameters', {})
+        num_joints_for_viz = model_hyperparams.get('num_joints_for_geom', 22)
+        features_per_joint_viz = model_hyperparams.get('features_per_joint_for_geom', 3)
+
+        if motion_to_animate_np.shape[1] != num_joints_for_viz * features_per_joint_viz:
+            logger.error(f"Generated sample motion features ({motion_to_animate_np.shape[1]}) mismatch. Cannot reshape for animation.")
+            return
+        
+        try:
+            motion_reshaped = motion_to_animate_np.reshape(
+                (self.sample_generation_num_frames, num_joints_for_viz, features_per_joint_viz)
+            )
+        except ValueError as e:
+            logger.error(f"Error reshaping sample motion data for animation: {e}.")
+            return
+
+        motion_centered = motion_reshaped - motion_reshaped[:, 0:1, :]
+        
+        # UNIT_CONVERSION: Adjust based on your model's output scale.
+        # If model output is mm-scale, use 1.0/1000.0. If meter-scale/normalized, use None or 1.0.
+        unit_conversion = 1.0 / 1000.0 if model_hyperparams.get("output_scale_is_mm", False) else None # Example: add "output_scale_is_mm" to config
+
+        # Ensure the output directory for samples exists
+        # self.sample_generation_output_dir is defined in __init__
+        # It uses model_save_dir from paths_config as a fallback if not specified in training_hyperparams
+        
+        run_name = self.config.get('run_name', 'default_run')
+        animation_filename = f"{run_name}_epoch{epoch_num}_arm{self.sample_generation_armature_id}.gif"
+        animation_output_path = os.path.join(self.sample_generation_output_dir, animation_filename)
+
+        logger.info(f"Creating sample animation: {animation_output_path}")
+        try:
+            create_motion_animation( # This function is from utils.diffusion_utils
+                motion_data_frames=motion_centered,
+                kinematic_chain=T2M_KINEMATIC_CHAIN, 
+                output_filename=animation_output_path,
+                fps=30,
+                unit_conversion_factor=unit_conversion,
+                y_z_swap=True
+            )
+        except Exception as e:
+            logger.error(f"Failed to create or save sample animation for epoch {epoch_num}: {e}")
+
+
+    def _get_timestep_loss_weights(self, timesteps: torch.Tensor) -> torch.Tensor:
+        """
+        Calculates loss weights based on the provided timesteps and the configured weighting scheme.
+        Assumes self.alphas_cumprod_trainer and self.snr_values are initialized if needed.
+        :param timesteps: Tensor of timesteps for which to calculate weights.
+        :return: Tensor of weights for each timestep, shape [bs] where bs is the batch size.
+        """
+        if self.loss_weighting_scheme == "none":
+            return torch.ones_like(timesteps, dtype=torch.float32, device=self.device)
+        
+        # Ensure timesteps are long for indexing
+        long_timesteps = timesteps.long()
+
+        if self.loss_weighting_scheme == "snr_plus_one":
+            selected_snr = self.snr_values[long_timesteps]
+            weights = selected_snr + 1.0
+        elif self.loss_weighting_scheme == "inv_sigma_squared":
+            # sigma_squared_t = 1 - alpha_bar_t
+            selected_alphas_cumprod = self.alphas_cumprod_trainer[long_timesteps]
+            weights = 1.0 / (1.0 - selected_alphas_cumprod + 1e-8) # Epsilon for stability
+        elif self.loss_weighting_scheme == "min_snr_gamma":
+            selected_snr = self.snr_values[long_timesteps]
+            weights = torch.minimum(selected_snr, torch.tensor(self.min_snr_gamma_value, device=self.device))
+        else:
+            logger.warning(f"Unknown weighting scheme '{self.loss_weighting_scheme}' in _get_timestep_loss_weights. Defaulting to no weights.")
+            return torch.ones_like(timesteps, dtype=torch.float32, device=self.device)
+        
+        # Optional: Normalize weights to have a mean of 1 for the batch.
+        # This can help stabilize training if weights vary a lot.
+        weights = weights / (weights.mean() + 1e-8)
+        return weights
 
     def _calculate_masked_x0_loss(self,
-                                predicted_x0: torch.Tensor,  # Model's direct output (predicted clean motion)
-                                target_x0: torch.Tensor,     # Ground truth clean motion
-                                bone_mask: torch.Tensor      # User's bone mask
-                                ) -> torch.Tensor:
+                                 predicted_x0: torch.Tensor,
+                                 target_x0: torch.Tensor,
+                                 bone_mask: torch.Tensor,
+                                 # Optional: per-sample weights for timestep-based weighting
+                                 sample_timestep_weights: Optional[torch.Tensor] = None
+                                 ) -> torch.Tensor:
         """
         Calculates the masked L1 or MSE loss between predicted x0 and target x0.
         This corresponds to L_simple in the MDM paper if using MSE.
         The bone_mask allows focusing the loss on specific joints/features.
-        :param predicted_x0: Predicted clean motion [bs, num_frames, num_features].
-        :param target_x0: Ground truth clean motion [bs, num_frames, num_features].
-        :param bone_mask: Bone mask [bs, num_frames, num_features] indicating active features.
-        :return: Masked loss tensor.
+        Optionally applies per-sample timestep weights if provided.
+
+        :param predicted_x0: Tensor of predicted x0 values, shape [bs, num_frames, num_features].
+        :param target_x0: Tensor of target x0 values, shape [bs, num_frames, num_features].
+        :param bone_mask: Tensor of shape [bs, num_frames, num_features] indicating active features.
+        :param sample_timestep_weights: Optional tensor of shape [bs] for per-sample timestep weights.
+        :return: Scalar tensor representing the final loss for the batch.
         """
         if self.main_loss_type == "l1":
             element_wise_loss = F.l1_loss(predicted_x0, target_x0, reduction='none')
@@ -488,107 +697,155 @@ class ArmatureMDMTrainer:
         else:
             raise ValueError(f"Unsupported main_loss_type: {self.main_loss_type}. Choose 'l1' or 'mse'.")
 
-        masked_loss = element_wise_loss * bone_mask
-        num_active_elements = bone_mask.sum()
+        # Apply bone mask
+        masked_element_wise_loss = element_wise_loss * bone_mask  # Shape: [bs, num_frames, num_features]
 
-        if num_active_elements == 0:
-            logger.warning("Bone mask sum is zero in _calculate_masked_x0_loss. Loss will be zero.")
-            # Return a zero loss tensor that requires grad if the model is in training
-            return torch.tensor(0.0, device=predicted_x0.device, requires_grad=predicted_x0.requires_grad)
-        return masked_loss.sum() / num_active_elements
-    
+        # Calculate mean loss per sample, normalized by active elements for that sample
+        sum_loss_per_sample = masked_element_wise_loss.sum(dim=[1, 2])  # Sum over frames and features -> [bs]
+        num_active_per_sample = bone_mask.sum(dim=[1, 2])  # -> [bs]
+        
+        # Handle cases where a sample might have no active elements (though unlikely with valid masks)
+        # Clamp num_active_per_sample to avoid division by zero, default loss to 0 for such samples.
+        is_inactive_sample = (num_active_per_sample == 0)
+        num_active_per_sample_safe = torch.clamp(num_active_per_sample, min=1e-8)
+        
+        mean_loss_per_sample = sum_loss_per_sample / num_active_per_sample_safe
+        mean_loss_per_sample[is_inactive_sample] = 0.0 # Ensure loss is 0 if no elements were active
 
-    def _run_batch(self, 
-                batch_data: Dict[str, Any], 
-                is_training_model: bool # True if model.train(), False if model.eval()
+        if is_inactive_sample.any():
+             logger.warning(f"{(is_inactive_sample.sum().item())} samples had zero active elements in bone_mask "
+                            f"within _calculate_masked_x0_loss.")
+
+        # Apply timestep-based sample weights if provided
+        if sample_timestep_weights is not None:
+            if sample_timestep_weights.shape[0] != mean_loss_per_sample.shape[0]:
+                raise ValueError(f"Shape mismatch: sample_timestep_weights ({sample_timestep_weights.shape}) "
+                                 f"and mean_loss_per_sample ({mean_loss_per_sample.shape})")
+            weighted_loss_per_sample = mean_loss_per_sample * sample_timestep_weights
+        else:
+            weighted_loss_per_sample = mean_loss_per_sample # No timestep weighting
+
+        # Final loss for the batch is the mean of these (potentially weighted) per-sample losses
+        final_batch_loss = weighted_loss_per_sample.mean()
+        
+        return final_batch_loss
+
+    def _get_tqdm_postfix_names(self, loss_components: Dict[str, float]) -> Dict[str, float]:
+        """
+        Helper function to shorten loss names for tqdm display.
+        This function maps long loss component names to shorter versions for better readability in tqdm progress bars.
+        :param loss_components: Dictionary of loss components with their values.
+        :return: Dictionary with shortened names for tqdm display.
+        """
+        # Define your mapping here
+        # The keys are the original loss component names, values are the short names
+        name_map = {
+            f"main_x0_loss ({self.main_loss_type}{'_ts_w' if self.loss_weighting_scheme != 'none' else ''})": "main_x0",
+            "main_x0_loss_unweighted_avg": "main_x0_uw",
+            "avg_timestep_weight": "ts_w_avg",
+            "velocity_loss": "vl",
+            "acceleration_loss": "ac_l",
+            "geom_pos_loss": "gpos_l",
+            "geom_vel_loss": "gvel_l",
+            "geom_foot_loss": "gfoot_l"
+        }
+        
+        short_postfix = {}
+        for k, v in loss_components.items():
+            short_name = name_map.get(k, k)
+            if len(short_name) > 10 and short_name == k:
+                parts = short_name.split('_')
+                if len(parts) > 1 :
+                    short_name = "".join(p[0] for p in parts if p) 
+                else:
+                    short_name = short_name[:8] + ".."
+
+
+            short_postfix[short_name] = f"{v:.4f}"
+        return short_postfix
+
+    def _run_batch(self,
+                    batch_data: Dict[str, Any],
+                    is_training_model: bool # True if model.train(), False if model.eval()
                 ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
-        Runs a single batch through the model and computes the loss.
-        :param batch_data: Dictionary containing batch data.
+        Runs a single batch through the model and computes the total loss and its components.
+
+        :param batch_data: Dictionary containing the batch data, including:
+            - "x_noisy": Noisy input tensor of shape [bs, num_frames, num_features].
+            - "timesteps": Tensor of timesteps for the batch, shape [bs].
+            - "target_x0": Target clean motion tensor of shape [bs, num_frames, num_features].
+            - "text_embeddings": Text embeddings for the batch, shape [bs, embedding_dim].
+            - "armature_class_ids": Tensor of armature class IDs for the batch, shape [bs].
         :param is_training_model: Boolean indicating if the model is in training mode.
-        :return: Tuple (total_loss, loss_components).
+        :return: Tuple containing:
+            - current_total_loss: Scalar tensor representing the total loss for the batch.
+            - loss_components: Dictionary with individual loss components for logging.
         """
-        x_noisy = batch_data["x_noisy"].to(self.device) # This is x_t, the noisy input to the model
-        timesteps = batch_data["timesteps"].to(self.device) # Diffusion timesteps
-        target_x0_for_main_loss = batch_data["target_x0"].to(self.device) # This is the ground truth clean motion, now the primary target
+        x_noisy = batch_data["x_noisy"].to(self.device)
+        timesteps = batch_data["timesteps"].to(self.device)
+        target_x0_for_main_loss = batch_data["target_x0"].to(self.device)
+        text_embeddings_batch = batch_data["text_embeddings"].to(self.device)
+        armature_class_ids = batch_data["armature_class_ids"].to(self.device)
 
-        text_embeddings_batch = batch_data["text_embeddings"].to(self.device) # Tensor of text embeddings
-        armature_class_ids = batch_data["armature_class_ids"].to(self.device) # Tensor of armature class IDs
-
-        # --- Classifier-Free Guidance (CFG) Training Logic ---
-        # Randomly drop conditions during training to enable CFG sampling.
-        # MDM paper randomly sets condition c to null (∅) for 10% of samples.
-        # We can achieve this by setting both uncond_text and uncond_armature to True.
-
-        # Start with uncond flags from batch_data, if provided (e.g., for specific eval cases)
+        # Classifier-Free Guidance (CFG) logic
         cfg_uncond_text = batch_data.get('uncond_text', False)
         cfg_uncond_armature = batch_data.get('uncond_armature', False)
-
         if is_training_model and self.cfg_drop_prob > 0:
-            # Overall probability to drop the entire condition 'c' (text AND armature)
             if torch.rand(1).item() < self.cfg_drop_prob:
                 cfg_uncond_text = True
                 cfg_uncond_armature = True
-            # Else, you could implement more granular dropping (e.g., only text, only armature)
-            # For simplicity, this implements dropping the full condition 'c'.
-            # The ArmatureMDM's _apply_dropout_mask(force_mask=True) will handle zeroing out.
 
         motion_padding_mask = batch_data.get('motion_padding_mask')
         if motion_padding_mask is not None:
             motion_padding_mask = motion_padding_mask.to(self.device)
 
-        # --- Model Forward Pass ---
-        # The model now predicts the clean sample x0 directly
+        # Model Forward Pass
         predicted_x0 = self.model(
-            x=x_noisy,  # Input is x_t (noisy motion)
-            timesteps=timesteps,
-            text_embeddings_batch=text_embeddings_batch,
-            armature_class_ids=armature_class_ids,
-            uncond_text=cfg_uncond_text,      # Pass CFG flag for text
-            uncond_armature=cfg_uncond_armature, # Pass CFG flag for armature
-            motion_padding_mask=motion_padding_mask
-        ) # Output is predicted_x0
+            x=x_noisy, timesteps=timesteps, text_embeddings_batch=text_embeddings_batch,
+            armature_class_ids=armature_class_ids, uncond_text=cfg_uncond_text,
+            uncond_armature=cfg_uncond_armature, motion_padding_mask=motion_padding_mask
+        )
 
-        bs, num_frames, num_total_motion_features = predicted_x0.shape # Or use x_noisy.shape
+        _bs, num_frames, num_total_motion_features = predicted_x0.shape
 
-        # Get the bone mask for the full sequence length (of x0)
         bone_mask_full_seq = self.get_bone_mask_fn(
-            armature_class_ids, 
-            num_total_motion_features, 
-            num_frames,
-            self.device,
-            armature_config_data=self.armature_config_data
+            armature_class_ids, num_total_motion_features, num_frames,
+            str(self.device), armature_config_data=self.armature_config_data
         )
 
-        # --- Main Loss Calculation (on predicted x0) ---
-        # Corresponds to L_simple in MDM paper plus your bone masking
+        # --- Main x0 Loss Calculation (with optional timestep weighting) ---
+        # Get timestep weights based on the configured scheme
+        timestep_loss_w = self._get_timestep_loss_weights(timesteps) if self.loss_weighting_scheme != "none" else None
+        
         main_x0_loss = self._calculate_masked_x0_loss(
-            predicted_x0,          # Model's prediction of clean motion
-            target_x0_for_main_loss, # Ground truth clean motion
-            bone_mask_full_seq     # Your custom bone mask
+            predicted_x0,
+            target_x0_for_main_loss,
+            bone_mask_full_seq,
+            sample_timestep_weights=timestep_loss_w # Pass weights here
         )
+
         current_total_loss = main_x0_loss
-        loss_components = {"main_x0_loss": main_x0_loss.item()} # Updated loss name
+        loss_components = {
+            f"main_x0_loss ({self.main_loss_type}{'_ts_w' if self.loss_weighting_scheme != 'none' else ''})": main_x0_loss.item()
+        }
+        if self.loss_weighting_scheme != "none" and timestep_loss_w is not None:
+            loss_components["avg_timestep_weight"] = timestep_loss_w.mean().item()
+            # To log the unweighted version for comparison if weighting is active:
+            unweighted_main_x0_loss_for_logging = self._calculate_masked_x0_loss(
+                predicted_x0, target_x0_for_main_loss, bone_mask_full_seq, sample_timestep_weights=None
+            )
+            loss_components["main_x0_loss_unweighted_avg"] = unweighted_main_x0_loss_for_logging.item()
 
         # --- Optional Kinematic Losses ---
-        # These are applied to the predicted x0, consistent with MDM's geometric losses
         if self.kinematic_loss_calculator:
-            # target_x0_for_main_loss is the same ground truth x0 needed by kinematic calculator
-
-            # scheduler_params from batch_data might be less relevant now for kinematic_loss_calculator
-            # if it no longer needs to derive x0 from noise.
-            # x_t (x_noisy) and timesteps might also be less relevant for it.
-            # Pass them if your kinematic loss implementation still uses them for some reason.
-            scheduler_params_for_kin_calc = batch_data.get("scheduler_params", {}) 
-
+            # Kinematic losses are weighted by their own internal lambda weights.
+            # armature_config_data is passed for its internal bone mask generation.
+            scheduler_params_for_kin_calc = batch_data.get("scheduler_params", {})
             kin_loss, kin_losses_dict = self.kinematic_loss_calculator.compute_losses(
-                x_t=x_noisy, # Original noisy input (may or may not be needed by kin_calc now)
-                timesteps=timesteps, # Original timesteps (may or may not be needed)
-                predicted_x0_from_model=predicted_x0, # Pass the model's direct x0 prediction
-                target_x0=target_x0_for_main_loss,    # Ground truth clean motion
-                scheduler_params=scheduler_params_for_kin_calc, # Pass if still used by kin_calc
-                armature_class_ids=armature_class_ids,
-                is_training_model=is_training_model,
+                x_t=x_noisy, timesteps=timesteps, predicted_x0_from_model=predicted_x0,
+                target_x0=target_x0_for_main_loss, scheduler_params=scheduler_params_for_kin_calc,
+                armature_class_ids=armature_class_ids, is_training_model=is_training_model,
                 armature_config_data=self.armature_config_data
             )
             current_total_loss = current_total_loss + kin_loss
@@ -596,102 +853,21 @@ class ArmatureMDMTrainer:
 
         # --- Optional MDM Geometric Losses ---
         if self.mdm_geometric_loss_calculator:
+            # MDM Geometric losses are weighted by their own internal lambda weights.
+            # armature_config_data is passed for its internal bone mask generation.
             foot_contact_gt = batch_data.get("foot_contact_ground_truth")
             if foot_contact_gt is not None:
                 foot_contact_gt = foot_contact_gt.to(self.device)
             
             mdm_geom_loss, mdm_geom_losses_dict = self.mdm_geometric_loss_calculator.compute_losses(
-                predicted_x0=predicted_x0,
-                target_x0=target_x0_for_main_loss,
-                foot_contact_gt=foot_contact_gt,
-                armature_class_ids=armature_class_ids,
-                armature_config_data=self.armature_config_data,
+                predicted_x0=predicted_x0, target_x0=target_x0_for_main_loss,
+                foot_contact_gt=foot_contact_gt, armature_class_ids=armature_class_ids,
+                armature_config_data=self.armature_config_data
             )
             current_total_loss = current_total_loss + mdm_geom_loss
             loss_components.update(mdm_geom_losses_dict)
-
+            
         return current_total_loss, loss_components
-
-
-    def train_epoch(self, data_loader: DataLoader) -> Tuple[float, Dict[str, float]]:
-        """
-        Trains the model for one epoch.
-        :param data_loader: DataLoader for the training data.
-        :return: Tuple (average loss, dictionary of average loss components).
-        """
-        self.model.train()
-        epoch_total_loss = 0.0
-        epoch_loss_components_sum: Dict[str, float] = {} # To average individual losses
-        num_batches = len(data_loader)
-        batch_iterator = tqdm(data_loader, desc=f"Training Epoch Progress", total=num_batches, leave=True)
-
-        for batch_idx, batch_data in enumerate(batch_iterator):
-            self.optimizer.zero_grad()
-            batch_total_loss, batch_loss_components = self._run_batch(batch_data, is_training_model=True)
-            
-            if torch.isnan(batch_total_loss): # Check for NaN loss
-                logger.warning(f"NaN loss detected at batch {batch_idx}. Skipping update. Components: {batch_loss_components}")
-                # Potentially skip optimizer step or handle error
-                # For now, we'll just log and it will propagate if not handled
-                # To prevent propagation of NaN to accumulated loss, we can skip this batch's loss
-                if not torch.isnan(batch_total_loss): # Re-check, as 0/0 can become NaN if num_active is 0
-                    epoch_total_loss += batch_total_loss.item()
-                    for key, val in batch_loss_components.items():
-                        epoch_loss_components_sum[key] = epoch_loss_components_sum.get(key, 0.0) + val
-                continue # Skip backprop and step if loss is NaN
-
-
-            batch_total_loss.backward()
-            self.optimizer.step()
-            
-            epoch_total_loss += batch_total_loss.item()
-            for key, val in batch_loss_components.items():
-                epoch_loss_components_sum[key] = epoch_loss_components_sum.get(key, 0.0) + val
-
-            if (batch_idx + 1) % max(1, num_batches // 10) == 0: # Log every 10% of batches
-                log_components = ", ".join([f"{k}: {v:.4f}" for k,v in batch_loss_components.items()])
-                logger.info(f"  Batch {batch_idx+1}/{num_batches}, Total Loss: {batch_total_loss.item():.4f} ({log_components})")
-        
-            batch_iterator.set_postfix(loss=batch_total_loss.item(), **{k: f"{v:.4f}" for k,v in batch_loss_components.items()})
-
-        avg_epoch_loss = epoch_total_loss / num_batches if num_batches > 0 else 0
-        avg_loss_components = {k: v / num_batches if num_batches > 0 else 0 for k, v in epoch_loss_components_sum.items()}
-        
-        return avg_epoch_loss, avg_loss_components
-
-    def evaluate_epoch(self, data_loader: DataLoader) -> Tuple[float, Dict[str, float]]:
-        """
-        Evaluates the model for one epoch.
-        :param data_loader: DataLoader for the evaluation data.
-        :return: Tuple (average loss, dictionary of average loss components).
-        """
-        self.model.eval()
-        epoch_total_loss = 0.0
-        epoch_loss_components_sum: Dict[str, float] = {}
-        num_batches = len(data_loader)
-        batch_iterator = tqdm(data_loader, desc=f"Validation Epoch Progress", total=num_batches, leave=True)
-
-        with torch.no_grad():
-            for batch_idx, batch_data in enumerate(batch_iterator):
-                batch_total_loss, batch_loss_components = self._run_batch(batch_data, is_training_model=False)
-                
-                if not torch.isnan(batch_total_loss): # Only add if not NaN
-                    epoch_total_loss += batch_total_loss.item()
-                    for key, val in batch_loss_components.items():
-                        epoch_loss_components_sum[key] = epoch_loss_components_sum.get(key, 0.0) + val
-
-                if (batch_idx + 1) % max(1, num_batches // 10) == 0:
-                    log_components = ", ".join([f"{k}: {v:.4f}" for k,v in batch_loss_components.items()])
-                    logger.debug(f"  Eval Batch {batch_idx+1}/{num_batches}, Total Loss: {batch_total_loss.item():.4f} ({log_components})")
-        
-                if not torch.isnan(batch_total_loss):
-                    batch_iterator.set_postfix(loss=batch_total_loss.item(), **{k: f"{v:.4f}" for k,v in batch_loss_components.items()})
-                else:
-                    batch_iterator.set_postfix(loss='NaN')
-
-        avg_epoch_loss = epoch_total_loss / num_batches if num_batches > 0 else 0
-        avg_loss_components = {k: v / num_batches if num_batches > 0 else 0 for k, v in epoch_loss_components_sum.items()}
-        return avg_epoch_loss, avg_loss_components
 
     def train(self, 
               train_loader: DataLoader, 
@@ -708,86 +884,194 @@ class ArmatureMDMTrainer:
         logger.info(f"Early stopping patience: {self.early_stopping_patience} epochs, min delta: {self.early_stopping_min_delta}")
         logger.info(f"Best model will be saved to: {self.model_save_path}")
 
-        # Reset early stopping counters for a new training run
         self._early_stopping_counter = 0
         self._best_val_loss = float('inf')
+        self.completed_epochs_count = 0
+        
+        training_history = {'train_loss': [], 'val_loss': [], 'val_metric': []} # For plotting
 
-        for epoch in tqdm(range(1, num_epochs + 1), desc="Training Epoch", unit="epoch", leave=True):
-            logger.info(f"--- Training Epoch {epoch}/{num_epochs} ---")
+        for epoch in tqdm(range(1, num_epochs + 1), desc="Training Epoch", unit="epoch", leave=False): # leave=False for cleaner logs
+            self.completed_epochs_count = epoch
+            #logger.info(f"--- Training Epoch {epoch}/{num_epochs} ---")
             avg_train_loss, avg_train_components = self.train_epoch(train_loader)
             log_train_components_str = ", ".join([f"Avg {k}: {v:.4f}" for k,v in avg_train_components.items()])
             logger.info(f"Epoch {epoch} Training Summary: Avg Total Loss: {avg_train_loss:.4f} ({log_train_components_str})")
+            training_history['train_loss'].append(avg_train_loss)
 
             if val_loader:
-                logger.info(f"--- Validating Epoch {epoch}/{num_epochs} ---")
+                #logger.info(f"--- Validating Epoch {epoch}/{num_epochs} ---")
                 avg_val_loss, avg_val_components = self.evaluate_epoch(val_loader)
                 log_val_components_str = ", ".join([f"Avg {k}: {v:.4f}" for k,v in avg_val_components.items()])
                 logger.info(f"Epoch {epoch} Validation Summary: Avg Total Loss: {avg_val_loss:.4f} ({log_val_components_str})")
+                training_history['val_loss'].append(avg_val_loss)
+                # Assuming avg_val_loss is the main metric for early stopping and lr scheduling for now
+                training_history['val_metric'].append(avg_val_loss)
 
-                # Early Stopping Check
                 if avg_val_loss < self._best_val_loss - self.early_stopping_min_delta:
                     self._best_val_loss = avg_val_loss
-                    self._early_stopping_counter = 0 # Reset counter
+                    self._early_stopping_counter = 0
                     logger.info(f"New best validation loss: {self._best_val_loss:.4f}. Saving model...")
                     try:
-                        # Save model checkpoint (can include epoch, optimizer state etc. if needed)
                         torch.save({
                             'epoch': epoch,
                             'model_state_dict': self.model.state_dict(),
                             'optimizer_state_dict': self.optimizer.state_dict(),
                             'val_loss': self._best_val_loss,
-                            # You can add more info like model_params here
+                            'config': self.config # Save config with the model
                         }, self.model_save_path)
+
                         logger.info(f"Model saved to {self.model_save_path}")
+
                     except Exception as e:
                         logger.error(f"Error saving model: {e}")
                 else:
                     self._early_stopping_counter += 1
-                    logger.info(f"Validation loss did not improve significantly. Early stopping counter: {self._early_stopping_counter}/{self.early_stopping_patience}")
-
+                    #logger.info(f"Validation loss did not improve significantly. Early stopping counter: {self._early_stopping_counter}/{self.early_stopping_patience}")
                 if self._early_stopping_counter >= self.early_stopping_patience:
                     logger.info(f"Early stopping triggered at epoch {epoch}.")
-                    break # Exit training loop
-            
-            else: # No validation loader, save model at the end of each epoch or based on train loss (less ideal)
-                if epoch % 10 == 0: # Example: save every 10 epochs if no validation
+                    break 
+            else: 
+                if epoch % 10 == 0: 
                      logger.info(f"No validation loader. Saving model checkpoint at epoch {epoch}...")
                      temp_save_path = self.model_save_path.replace(".pth", f"_epoch{epoch}.pth")
                      try:
+
                         torch.save({
                             'epoch': epoch,
                             'model_state_dict': self.model.state_dict(),
                             'optimizer_state_dict': self.optimizer.state_dict(),
-                            # 'train_loss': avg_train_loss, # Optional
+                            'config': self.config
                         }, temp_save_path)
+
                         logger.info(f"Model checkpoint saved to {temp_save_path}")
                      except Exception as e:
                         logger.error(f"Error saving model checkpoint: {e}")
 
-
             if self.lr_scheduler:
-                # Common practice: step LR scheduler based on validation loss or after each epoch
-                # If using ReduceLROnPlateau, step with validation loss
                 if isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau) and val_loader:
                     self.lr_scheduler.step(avg_val_loss)
                 elif not isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                    self.lr_scheduler.step() # For schedulers like StepLR, CosineAnnealingLR etc.
+                    self.lr_scheduler.step()
                 
                 if hasattr(self.optimizer, 'param_groups'):
                      current_lr = self.optimizer.param_groups[0]['lr']
                      logger.info(f"Current learning rate: {current_lr:.6e}")
-        
-        logger.info("ArmatureMDM training finished.")
-        if not val_loader: # If no validation, save the final model
+
+            if self.generate_sample_every_n_epochs > 0 and \
+               epoch % self.generate_sample_every_n_epochs == 0:
+                current_model_training_state = self.model.training # Save current state
+                generated_sample_tensor = self._generate_sample_for_inspection(epoch_num=epoch)
+                if generated_sample_tensor is not None:
+                    self._save_and_animate_sample(generated_sample_tensor, epoch_num=epoch)
+                self.model.train(current_model_training_state)
+                    
+        logger.info(f"ArmatureMDM training finished after {self.completed_epochs_count} epochs.")
+        if not val_loader and self.completed_epochs_count == num_epochs : # Only save final if full epochs run without validation
             logger.info(f"Saving final model (trained for {num_epochs} epochs without validation-based early stopping)...")
-            final_save_path = self.model_save_path.replace(".pth", "_final.pth")
+            final_save_path = self.model_save_path # Overwrite or create new name
+            if os.path.exists(self.model_save_path) and self._best_val_loss == float('inf'): # If best model wasn't saved due to no val
+                final_save_path = self.model_save_path.replace(".pth", "_final_no_val.pth")
             try:
                 torch.save({
-                    'epoch': num_epochs,
+                    'epoch': self.completed_epochs_count,
                     'model_state_dict': self.model.state_dict(),
                     'optimizer_state_dict': self.optimizer.state_dict(),
+                    'config': self.config
                 }, final_save_path)
+
                 logger.info(f"Final model saved to {final_save_path}")
             except Exception as e:
                 logger.error(f"Error saving final model: {e}")
+        return training_history 
 
+
+    def train_epoch(self, data_loader: DataLoader) -> Tuple[float, Dict[str, float]]:
+        """
+        Trains the model for one epoch using the provided DataLoader.
+        :param data_loader: DataLoader for the training data.
+        :return: Tuple containing the average loss for the epoch and a dictionary of loss components.
+        """
+        self.model.train()
+        epoch_total_loss = 0.0
+        epoch_loss_components_sum: Dict[str, float] = {}
+        num_batches = len(data_loader)
+        
+        # Corrected tqdm description to use self.completed_epochs_count if available, or a generic message
+        #current_epoch_display = self.completed_epochs_count if hasattr(self, 'completed_epochs_count') and self.completed_epochs_count > 0 else "Current"
+        #batch_iterator = tqdm(data_loader, desc=f"Tr Ep {current_epoch_display}", total=num_batches, leave=True, ncols=None)
+
+        for batch_idx, batch_data in enumerate(data_loader):
+            self.optimizer.zero_grad()
+            batch_total_loss, batch_loss_components = self._run_batch(batch_data, is_training_model=True)
+            
+            if torch.isnan(batch_total_loss):
+                logger.warning(f"NaN loss detected at batch {batch_idx}. Skipping update. Components: {batch_loss_components}")
+                continue
+
+            batch_total_loss.backward()
+            # Optional: Gradient Clipping
+            # torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            self.optimizer.step()
+            
+            epoch_total_loss += batch_total_loss.item()
+            for key, val in batch_loss_components.items():
+                epoch_loss_components_sum[key] = epoch_loss_components_sum.get(key, 0.0) + val
+            
+            '''
+            if (batch_idx + 1) % max(1, num_batches // 10) == 0: # Log every 10%
+                log_components_str = ", ".join([f"{k}: {v:.4f}" for k,v in batch_loss_components.items()])
+                logger.info(f"  Batch {batch_idx+1}/{num_batches}, Total Loss: {batch_total_loss.item():.4f} ({log_components_str})")
+        
+            tqdm_postfix_short = self._get_tqdm_postfix_names(batch_loss_components)
+            batch_iterator.set_postfix(loss=f"{batch_total_loss.item():.4f}", **tqdm_postfix_short)
+            '''
+
+        avg_epoch_loss = epoch_total_loss / num_batches if num_batches > 0 else 0.0
+        avg_loss_components = {k: v / num_batches if num_batches > 0 else 0.0 for k, v in epoch_loss_components_sum.items()}
+        
+        return avg_epoch_loss, avg_loss_components
+
+    def evaluate_epoch(self, data_loader: DataLoader) -> Tuple[float, Dict[str, float]]:
+        """
+        Evaluates the model for one epoch using the provided DataLoader.
+        :param data_loader: DataLoader for the validation data.
+        :return: Tuple containing the average loss for the epoch and a dictionary of loss components.
+        """
+        self.model.eval()
+        epoch_total_loss = 0.0
+        epoch_loss_components_sum: Dict[str, float] = {}
+        num_batches = len(data_loader)
+
+        #current_epoch_display = self.completed_epochs_count if hasattr(self, 'completed_epochs_count') and self.completed_epochs_count > 0 else "Current"
+        #batch_iterator = tqdm(data_loader, desc=f"Val Ep {current_epoch_display}", total=num_batches, leave=True, ncols=None)
+
+        with torch.no_grad():
+            for batch_idx, batch_data in enumerate(data_loader):
+                batch_total_loss, batch_loss_components = self._run_batch(batch_data, is_training_model=False)
+                
+                if not torch.isnan(batch_total_loss):
+                    epoch_total_loss += batch_total_loss.item()
+                    for key, val in batch_loss_components.items():
+                        epoch_loss_components_sum[key] = epoch_loss_components_sum.get(key, 0.0) + val
+                else:
+                    '''
+                    tqdm_postfix_short = {"status": "NaN_loss"}
+                    batch_iterator.set_postfix(loss="NaN", **tqdm_postfix_short)
+                    '''
+                    logger.warning(f"NaN loss detected during validation at batch {batch_idx} in epoch {epoch_num}.")
+                    continue
+                    
+                '''
+                if (batch_idx + 1) % max(1, num_batches // 10) == 0:
+                    log_components_str = ", ".join([f"{k}: {v:.4f}" for k,v in batch_loss_components.items()])
+                    logger.debug(f"  Eval Batch {batch_idx+1}/{num_batches}, Total Loss: {batch_total_loss.item():.4f} ({log_components_str})")
+        
+                if not torch.isnan(batch_total_loss):
+                    tqdm_postfix_short = self._get_tqdm_postfix_names(batch_loss_components)
+                    batch_iterator.set_postfix(loss=f"{batch_total_loss.item():.4f}", **tqdm_postfix_short)
+                '''
+
+        avg_epoch_loss = epoch_total_loss / num_batches if num_batches > 0 else 0.0
+        avg_loss_components = {k: v / num_batches if num_batches > 0 else 0.0 for k, v in epoch_loss_components_sum.items()}
+
+        return avg_epoch_loss, avg_loss_components

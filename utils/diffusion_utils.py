@@ -3,7 +3,9 @@ import logging
 import os
 from typing import Dict, List, Optional
 
+from matplotlib.animation import FuncAnimation, PillowWriter
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 from sentence_transformers import SentenceTransformer
 import torch
@@ -323,3 +325,117 @@ def generate_and_save_sbert_embeddings(
         logger.info(f"SBERT embeddings saved to: {output_embeddings_path}")
     except Exception as e:
         logger.error(f"Failed to save SBERT embeddings to {output_embeddings_path}: {e}")
+
+
+T2M_KINEMATIC_CHAIN = [[0, 2, 5, 8, 11], [0, 1, 4, 7, 10], [0, 3, 6, 9, 12, 15], [9, 14, 17, 19, 21], [9, 13, 16, 18, 20]]
+
+def create_motion_animation(
+    motion_data_frames: np.ndarray, # Expects (num_frames, num_joints, 3)
+    kinematic_chain: list,
+    output_filename: str = 'generated_animation.gif',
+    fps: int = 30,
+    unit_conversion_factor: Optional[float] = None,
+    y_z_swap: bool = True
+) -> FuncAnimation:
+    """
+    Creates and saves/displays a 3D skeleton animation from motion data.
+
+    :param motion_data_frames: NumPy array of motion data, shape (num_frames, num_joints, 3).
+                               It's assumed to be root-centered before calling this.
+    :param kinematic_chain: A list of lists defining joint connections.
+    :param output_filename: Name of the file to save the animation.
+    :param fps: Frames per second for the animation.
+    :param unit_conversion_factor: Factor to multiply joint coordinates by (e.g., for mm to m).
+                                   If None, no conversion is applied.
+    :param y_z_swap: If True, swaps Y and Z coordinates for display.
+    :return: The Matplotlib FuncAnimation object.
+    """
+    processed_motion = motion_data_frames.copy()
+    if unit_conversion_factor is not None:
+        processed_motion = processed_motion * unit_conversion_factor
+
+    x_min, x_max = processed_motion[:,:,0].min(), processed_motion[:,:,0].max()
+    y_src_idx, z_src_idx = (2, 1) if y_z_swap else (1, 2) # Swapped for correct limit calculation if display is swapped
+    
+    y_min, y_max = processed_motion[:,:,y_src_idx].min(), processed_motion[:,:,y_src_idx].max()
+    z_min, z_max = processed_motion[:,:,z_src_idx].min(), processed_motion[:,:,z_src_idx].max()
+    
+    x_mid, y_mid, z_mid = (x_min+x_max)/2, (y_min+y_max)/2, (z_min+z_max)/2
+    plot_radius = max(x_max-x_min, y_max-y_min, z_max-z_min) / 2.0 + 0.15 # Add some padding
+
+    fig = plt.figure(figsize=(6,6))
+    ax = fig.add_subplot(111, projection='3d')
+
+    ax.set_xlim(x_mid - plot_radius, x_mid + plot_radius)
+    if y_z_swap:
+        ax.set_ylim(z_mid - plot_radius, z_mid + plot_radius) # Matplotlib's Y becomes our Z
+        ax.set_zlim(y_mid - plot_radius, y_mid + plot_radius) # Matplotlib's Z becomes our Y
+        ax.set_xlabel('X')
+        ax.set_ylabel('Z (Depth)')
+        ax.set_zlabel('Y (Up)')
+    else:
+        ax.set_ylim(y_mid - plot_radius, y_mid + plot_radius)
+        ax.set_zlim(z_mid - plot_radius, z_mid + plot_radius)
+        ax.set_xlabel('X')
+        ax.set_ylabel('Y')
+        ax.set_zlabel('Z')
+
+    ax.set_box_aspect((1,1,1))
+    ax.view_init(elev=20, azim=120)
+    # ax.set_axis_off() # Uncomment to turn off axis lines and labels
+
+    bones = []
+    for chain_part in kinematic_chain:
+        for i in range(len(chain_part) - 1):
+            bones.append((chain_part[i], chain_part[i+1]))
+
+    scat = ax.scatter([], [], [], c='blue', s=25, alpha=0.8)
+    lines = [ax.plot([], [], [], 'blue', linewidth=1.5, alpha=0.8)[0] for _ in bones]
+
+    num_frames_total = processed_motion.shape[0]
+
+    def init_anim():
+        scat._offsets3d = ([], [], [])
+        for ln in lines:
+            ln.set_data_3d([], [], [])
+        return [scat] + lines
+
+    def update_anim(frame_idx):
+        current_frame_data = processed_motion[frame_idx]
+        
+        display_coords = current_frame_data[:, [0, z_src_idx, y_src_idx]] if y_z_swap else current_frame_data
+
+        scat._offsets3d = (display_coords[:,0], display_coords[:,1], display_coords[:,2])
+        for bone_indices, line_artist in zip(bones, lines):
+            idx1, idx2 = bone_indices
+            line_artist.set_data_3d(
+                [display_coords[idx1,0], display_coords[idx2,0]],
+                [display_coords[idx1,1], display_coords[idx2,1]],
+                [display_coords[idx1,2], display_coords[idx2,2]]
+            )
+        fig.canvas.draw() # Update title per frame if dynamic titles needed
+        # ax.set_title(f'Frame {frame_idx + 1}/{num_frames_total}') # Optional: dynamic title
+        return [scat] + lines
+
+    animation = FuncAnimation(
+        fig,
+        update_anim,
+        frames=num_frames_total,
+        init_func=init_anim,
+        blit=True, # Try False if blit=True causes issues with 3D plots
+        interval=1000/fps
+    )
+
+    try:
+        animation.save(output_filename, writer=PillowWriter(fps=fps))
+        print(f"Animation saved to {output_filename}")
+    except Exception as e:
+        print(f"Error saving animation with Pillow: {e}. You might need to install Pillow: pip install Pillow")
+        try: # Fallback to imagemagick
+            animation.save(output_filename, writer='imagemagick', fps=fps)
+            print(f"Animation saved to {output_filename} using imagemagick.")
+        except Exception as e2:
+            print(f"Error saving animation with imagemagick: {e2}. Is imagemagick installed and in PATH?")
+            
+    plt.close(fig)
+    return animation
