@@ -392,29 +392,38 @@ class ADMTrainer:
         return vel, accel
 
     def _compute_losses_dict(self, x_start_gt: torch.Tensor, predicted_x0: torch.Tensor,
-                             t: torch.Tensor, y_cond: Dict[str, Any], bone_mask: torch.Tensor
-                             ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """ Computes the losses for the given ground truth and predicted tensors. """
+                                t: torch.Tensor, y_cond: Dict[str, Any], bone_mask: torch.Tensor
+                                ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """ 
+        Computes the losses for the given ground truth and predicted tensors. 
+        Returns a tuple of total loss tensor and a dictionary of individual loss terms.
+        :param x_start_gt: Ground truth motion tensor, shape [bs, nframes, nfeatures].
+        :param predicted_x0: Predicted motion tensor from the model, shape [bs, nframes, nfeatures].
+        :param t: Tensor of timesteps, shape [bs].
+        :param y_cond: Dictionary containing conditioning information (e.g., text embeddings, armature IDs).
+        :param bone_mask: Bone mask tensor, shape [bs, nframes, nfeatures].
+        :return: Tuple[torch.Tensor, Dict[str, float]]: Total loss tensor and a dictionary of loss terms.
+        """
         terms = {}
         current_total_loss = torch.tensor(0.0, device=self.device)
         temporal_mask = y_cond.get('mask') # Expected: [bs, 1, 1, nframes_gt], True for VALID
 
         combined_mask_x0 = self._get_combined_mask(temporal_mask, bone_mask, x_start_gt.shape)
         timestep_weights = self._get_timestep_loss_weights(t)
-        
+
         main_loss_val = self._calculate_masked_loss(
             predicted_x0, x_start_gt, combined_mask_x0, self.main_loss_type,
             sample_timestep_weights=timestep_weights )
-        terms[f"main_loss/{self.main_loss_type}"] = main_loss_val.item() # Changed for clarity
+        terms[f"main_loss/{self.main_loss_type}"] = main_loss_val.item()
         current_total_loss += main_loss_val
-        if timestep_weights is not None:
+        if timestep_weights is not None: # Assuming timestep_weights is always a tensor if not None
             terms["debug/avg_timestep_weight"] = timestep_weights.mean().item()
 
         pred_vel, pred_accel = self._get_derivatives(predicted_x0)
         target_vel, target_accel = self._get_derivatives(x_start_gt)
 
         if self.use_kinematic_losses:
-            if self.lambda_kin_vel > 0 and pred_vel.shape[1] > 0:
+            if self.lambda_kin_vel > 0 and pred_vel.shape[1] > 0: # Check if velocity frames exist
                 mask_vel_temp = temporal_mask[..., :pred_vel.shape[1]] if temporal_mask is not None else None
                 bone_mask_vel = bone_mask[:, :pred_vel.shape[1], :]
                 combined_mask_kin_vel = self._get_combined_mask(mask_vel_temp, bone_mask_vel, target_vel.shape)
@@ -422,18 +431,19 @@ class ADMTrainer:
                 terms["kinematic/velocity_loss"] = loss_val.item()
                 current_total_loss += self.lambda_kin_vel * loss_val
 
-            if self.lambda_kin_accel > 0 and pred_accel.shape[1] > 0:
+            if self.lambda_kin_accel > 0 and pred_accel.shape[1] > 0: # Check if acceleration frames exist
                 mask_accel_temp = temporal_mask[..., :pred_accel.shape[1]] if temporal_mask is not None else None
                 bone_mask_accel = bone_mask[:, :pred_accel.shape[1], :]
                 combined_mask_kin_accel = self._get_combined_mask(mask_accel_temp, bone_mask_accel, target_accel.shape)
                 loss_val = self._calculate_masked_loss(pred_accel, target_accel, combined_mask_kin_accel, self.kinematic_loss_type)
                 terms["kinematic/acceleration_loss"] = loss_val.item()
                 current_total_loss += self.lambda_kin_accel * loss_val
-        
+
         if self.use_mdm_geometric_losses:
-            # (Ensure data is XYZ for these if that's what MDM original expects)
+            bs_geom, nframes_geom, _ = predicted_x0.shape # Or x_start_gt.shape
+
             if self.lambda_geom_pos > 0:
-                loss_val = self._calculate_masked_loss(predicted_x0, x_start_gt, combined_mask_x0, "mse")
+                loss_val = self._calculate_masked_loss(predicted_x0, x_start_gt, combined_mask_x0, "mse") # MDM uses MSE for geometric pos
                 terms["geometric/position_loss"] = loss_val.item()
                 current_total_loss += self.lambda_geom_pos * loss_val
             
@@ -441,21 +451,75 @@ class ADMTrainer:
                 mask_vel_temp_geom = temporal_mask[..., :pred_vel.shape[1]] if temporal_mask is not None else None
                 bone_mask_vel_geom = bone_mask[:, :pred_vel.shape[1], :]
                 combined_mask_geom_vel = self._get_combined_mask(mask_vel_temp_geom, bone_mask_vel_geom, target_vel.shape)
-                loss_val = self._calculate_masked_loss(pred_vel, target_vel, combined_mask_geom_vel, "mse")
+                loss_val = self._calculate_masked_loss(pred_vel, target_vel, combined_mask_geom_vel, "mse") # MDM uses MSE for geometric vel
                 terms["geometric/velocity_loss"] = loss_val.item()
                 current_total_loss += self.lambda_geom_vel * loss_val
 
-            if self.lambda_geom_foot > 0 and y_cond.get("foot_contact_ground_truth") is not None and pred_vel.shape[1] > 0 :
-                # ... (Foot contact loss logic, needs careful adaptation and bone_mask for foot features) ...
-                # Placeholder for L_foot implementation
-                # loss_foot_val = calculate_your_l_foot(...)
-                # terms["geometric/foot_contact_loss"] = loss_foot_val.item()
-                # current_total_loss += self.lambda_geom_foot * loss_foot_val
-                logger.debug("Foot contact loss calculation skipped (placeholder).")
+            if self.lambda_geom_foot > 0 and pred_vel.shape[1] > 0:
+                pred_x0_reshaped_geom = predicted_x0.reshape(bs_geom, nframes_geom, self.num_joints_for_geom, self.features_per_joint_for_geom)
+                
+                left_foot_idx = self.foot_joint_indices[0]
+                right_foot_idx = self.foot_joint_indices[1]
+                
+                # Velocities of predicted foot joints
+                pred_vel_reshaped_geom = pred_vel.reshape(bs_geom, nframes_geom - 1, self.num_joints_for_geom, self.features_per_joint_for_geom)
+                pred_left_foot_vel = pred_vel_reshaped_geom[:, :, left_foot_idx, :]  # [bs, nframes-1, 3 (xyz)]
+                pred_right_foot_vel = pred_vel_reshaped_geom[:, :, right_foot_idx, :] # [bs, nframes-1, 3 (xyz)]
+
+                foot_contact_gt = y_cond.get("foot_contact_ground_truth") # Expected: [bs, nframes, 2] (L, R) or similar
+
+                if foot_contact_gt is not None:
+                    # Ensure foot_contact_gt is [bs, nframes_vel, 2] and then unsqueeze
+                    contact_mask_left = foot_contact_gt[:, :nframes_geom-1, 0].unsqueeze(-1).float()  # [bs, nframes-1, 1]
+                    contact_mask_right = foot_contact_gt[:, :nframes_geom-1, 1].unsqueeze(-1).float() # [bs, nframes-1, 1]
+                else:
+                    # Heuristic: foot is in contact if its Y position in ground truth is low
+                    gt_x0_reshaped_geom = x_start_gt.reshape(bs_geom, nframes_geom, self.num_joints_for_geom, self.features_per_joint_for_geom)
+                    gt_left_foot_y_t = gt_x0_reshaped_geom[:, :nframes_geom-1, left_foot_idx, 1] # Y-coord at frame t for vel between t, t+1
+                    gt_right_foot_y_t = gt_x0_reshaped_geom[:, :nframes_geom-1, right_foot_idx, 1]
+
+                    height_threshold = 0.05 # Example: 5cm if data is in meters; tune this
+                    contact_mask_left = (torch.abs(gt_left_foot_y_t) < height_threshold).float().unsqueeze(-1)
+                    contact_mask_right = (torch.abs(gt_right_foot_y_t) < height_threshold).float().unsqueeze(-1)
+                    # logger.debug("Foot contact GT not provided, using Y-height heuristic for L_foot loss.")
+
+                target_foot_vel_when_contact = torch.zeros_like(pred_left_foot_vel, device=self.device)
+
+                loss_foot_left = F.mse_loss(pred_left_foot_vel * contact_mask_left,
+                                            target_foot_vel_when_contact * contact_mask_left,
+                                            reduction='none')
+                loss_foot_right = F.mse_loss(pred_right_foot_vel * contact_mask_right,
+                                                target_foot_vel_when_contact * contact_mask_right,
+                                                reduction='none')
+                
+                # Apply temporal mask if it exists
+                mask_vel_temp_geom_foot = None
+                if temporal_mask is not None:
+                    mask_vel_temp_geom_foot = temporal_mask[..., :pred_vel.shape[1]] # Up to nframes-1
+                    valid_temporal_mask_for_vel = mask_vel_temp_geom_foot.squeeze(1).squeeze(1).unsqueeze(-1).float() # -> [bs, nframes-1, 1]
+                    loss_foot_left = loss_foot_left * valid_temporal_mask_for_vel
+                    loss_foot_right = loss_foot_right * valid_temporal_mask_for_vel
+                        
+                    # Denominator for normalization: count elements where contact AND temporal mask are active
+                    num_active_left = (contact_mask_left * valid_temporal_mask_for_vel).sum() + 1e-8
+                    num_active_right = (contact_mask_right * valid_temporal_mask_for_vel).sum() + 1e-8
+                else:
+                    num_active_left = contact_mask_left.sum() + 1e-8
+                    num_active_right = contact_mask_right.sum() + 1e-8
+
+                # Sum losses and normalize by active elements
+                loss_foot_val = (loss_foot_left.sum() / num_active_left + loss_foot_right.sum() / num_active_right) / 2.0
+                
+                if not torch.isnan(loss_foot_val) and not torch.isinf(loss_foot_val):
+                    terms["geometric/foot_contact_loss"] = loss_foot_val.item()
+                    current_total_loss += self.lambda_geom_foot * loss_foot_val
+                else:
+                    terms["geometric/foot_contact_loss"] = 0.0 # Or some other indicator of failure for this batch item
+                    logger.warning(f"NaN or Inf in foot_contact_loss, skipping for this batch. L:{num_active_left.item()}, R:{num_active_right.item()}")
 
 
-        terms["total_loss"] = current_total_loss.item() # Store the final combined loss value too
-        return current_total_loss, terms # Return the tensor for backward, and dict for logging
+        terms["total_loss"] = current_total_loss.item()
+        return current_total_loss, terms
 
 
     def run_step(self, batch_data: Dict[str, Any]) -> Dict[str, float]:

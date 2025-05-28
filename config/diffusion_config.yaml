@@ -108,8 +108,8 @@ early_stopping:
 # The main loss implicitly has weight 1.0
 kinematic_losses: # Your kinematic losses (L1 or MSE on velocity/acceleration of x0)
   use_kinematic_losses: true
-  velocity_loss_weight: 0.5      
-  acceleration_loss_weight: 0.2
+  velocity_loss_weight: 0.7      
+  acceleration_loss_weight: 0.3
   kinematic_loss_type: "l1"      # Loss type (l1 or mse)
 
 mdm_geometric_losses: # Geometric losses inspired by MDM (always MSE)
@@ -117,7 +117,7 @@ mdm_geometric_losses: # Geometric losses inspired by MDM (always MSE)
   lambda_pos: 0.0                # MDM's L_rcxyz, often 0 if main loss is already on XYZ.
                                 # If your main_loss is on rotations, consider setting > 0 for XYZ supervision.
   lambda_vel: 0.7                # MDM's L_vel (on velocity of rotations or XYZ). RECOMMENDATION: Increased (e.g., 0.1 → 1.0)
-  lambda_foot: 0.5               # MDM's L_fc (foot contact). RECOMMENDED if you have foot_contact_gt. Requires implementation.
+  lambda_foot: 0.5               # MDM's L_fc (foot contact).
   foot_joint_indices: [10, 11]   # Example indices for left foot, right foot (based on HumanML3D)
 
 dataset_parameters:

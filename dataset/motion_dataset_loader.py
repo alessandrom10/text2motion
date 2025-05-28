@@ -94,8 +94,9 @@ def process_motion_file(file_path: str, num_expected_features: int) -> torch.Ten
         # joints_data = joints_data / 1000.0  # Example: Scale mm to m if your data is in mm
                                            # Or apply other normalization (e.g., to [-1, 1])
     else:
+        pass
         # Log a warning but proceed if possible, or raise an error if shape is critical
-        logger.warning(f"Unexpected data shape in {file_path}: {joints_data.shape}. Expected (T, J, 3). May affect preprocessing.")
+        #logger.warning(f"Unexpected data shape in {file_path}: {joints_data.shape}. Expected (T, J, 3). May affect preprocessing.")
 
     num_frames = joints_data.shape[0]
     try:
@@ -321,7 +322,6 @@ class MyTextToMotionDataset(TextToMotionDataset):
                     "seq_len": torch.tensor(num_frames, dtype=torch.long, device=self.data_device) # For padding mask by collate_fn
                 }
             except Exception as e:
-                logger.warning(f"Error processing sample for motion '{sample_info.get('motion_file_path', 'N/A')}' (idx_map {idx}, attempt {i}, actual_idx {current_idx}): {e}. Trying next.")
                 if i == len(self.samples) -1: # If this was the last attempt
                     logger.error(f"All attempts failed for initial index {idx}. Could not fetch a valid sample.")
                     return None # Indicate failure to collate_fn

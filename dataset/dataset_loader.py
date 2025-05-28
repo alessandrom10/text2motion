@@ -296,8 +296,8 @@ class MyTextToMotionDataset(Dataset):
                     "motion_actual_length": torch.tensor(current_processed_len, dtype=torch.long, device=self.data_device)
                 }
             except Exception as e:
-                logger.warning(f"Error processing sample '{sample_info.get('motion_file_path', 'N/A')}' "
-                               f"(index {current_idx}, attempt {attempt+1}): {e}", exc_info=False)
+                #logger.warning(f"Error processing sample '{sample_info.get('motion_file_path', 'N/A')}' "
+                #               f"(index {current_idx}, attempt {attempt+1}): {e}", exc_info=False)
                 if attempt == max_attempts - 1: # Last attempt
                     logger.error(f"All {max_attempts} attempts failed for initial index {idx}. Cannot fetch a valid sample.")
                     return None
