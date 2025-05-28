@@ -279,8 +279,8 @@ class ADMTrainer:
     def _initialize_early_stopping(self):
         """Initializes parameters for early stopping."""
         early_stop_cfg = self.args.get('early_stopping', {})
-        self.early_stopping_patience = early_stop_cfg.get('patience', 10) # Renamed from config
-        self.early_stopping_min_delta = early_stop_cfg.get('min_delta', 0.0001) # Renamed
+        self.early_stopping_patience = early_stop_cfg.get('early_stopping_patience', 30)
+        self.early_stopping_min_delta = early_stop_cfg.get('early_stopping_patience', 0.0001)
         self._early_stopping_counter = 0
         self._best_val_loss = float('inf')
 

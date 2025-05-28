@@ -81,96 +81,108 @@ def get_noise_schedule(num_diffusion_timesteps: int,
     return alphas_cumprod
 
 
-def sanitize_filename(name: str) -> str:
-    """ Sanitizes a string to be a valid filename. """
+def sanitize_filename(name: str, max_len: int = 50) -> str:
+    """ 
+    Sanitizes a string to be a valid filename component. 
+    Replaces invalid characters with underscores,
+    removes leading/trailing underscores, and limits length.
+    :param name: The string to sanitize.
+    :param max_len: Maximum length of the sanitized name.
+    :return: A sanitized string suitable for use as a filename.
+    """
+    if not isinstance(name, str):
+        name = str(name)
     name = name.lower()
-    name = re.sub(r'[^\w\s-]', '', name) # Remove non-alphanumeric, non-whitespace, non-hyphen
-    name = re.sub(r'[-\s]+', '_', name)  # Replace hyphens and spaces with underscores
-    return name[:50] # Truncate to a reasonable length
+    name = re.sub(r'[<>:"/\\|?*\n\r\t]', '_', name) # Replace invalid characters with underscores
+    name = re.sub(r'[\s_]+', '_', name) # Replace multiple spaces or underscores with a single underscore
+    name = name.strip('_')
+    return name[:max_len] # Truncate to max_len
 
 def plot_detailed_training_history(
     training_history: Dict[str, List[float]],
     model_save_dir: Path,
     run_name: str,
-    current_epoch_completed: int
+    current_epoch_completed: int # 1-based epoch number for titling
 ) -> None:
     """
-    Plots training & validation losses for each component and saves them as images.
+    Plots training & validation losses for each component and saves them as individual images.
+    Overwrites previous plots for the same run_name to keep only the latest.
 
-    :param training_history: Dictionary where keys are loss names
-                             (e.g., 'train_main_loss/mse', 'val_kinematic/velocity_loss')
-                             and values are lists of loss values per epoch.
+    :param training_history: Dictionary of loss histories.
     :param model_save_dir: Path object to the base directory to save the plots.
-    :param run_name: Name of the current run, used for plot filenames.
-    :param current_epoch_completed: The current epoch number (1-based) that has just finished.
+    :param run_name: Name of the current run.
+    :param current_epoch_completed: The current epoch number (1-based), for titling.
     """
     if not training_history:
         logger.warning("Plotting: Training history is empty. No plots will be generated.")
         return
 
-    plot_output_dir = model_save_dir / "loss_plots"
+    plot_output_dir = model_save_dir / "loss_plots_detailed"
     plot_output_dir.mkdir(parents=True, exist_ok=True)
 
+    sanitized_run_name = sanitize_filename(run_name)
     processed_basenames = set()
+    epochs_plotted_for_any_metric = 0
 
     for key in list(training_history.keys()):
         is_train_key = key.startswith('train_')
         is_val_key = key.startswith('val_')
 
         if is_train_key:
-            basename = key.replace('train_', '', 1)
+            basename = key[len("train_"):]
         elif is_val_key:
-            basename = key.replace('val_', '', 1)
+            basename = key[len("val_"):]
         else:
-            basename = key 
+            basename = key
         
         if basename in processed_basenames and (is_train_key or is_val_key):
             continue
         
-        plt.figure(figsize=(10, 6))
+        plt.figure(figsize=(12, 7))
         legend_items = []
-        
-        epochs_plotted = 0
+        current_max_epochs_in_history = 0
 
-        if f'train_{basename}' in training_history:
-            train_losses = training_history[f'train_{basename}']
-            if train_losses:
-                epochs_axis_train = range(1, len(train_losses) + 1)
-                plt.plot(epochs_axis_train, train_losses, 'bo-', label=f'Training {basename}')
-                legend_items.append(f'Training {basename}')
-                epochs_plotted = max(epochs_plotted, len(train_losses))
-            processed_basenames.add(basename) # Mark as processed
+        train_data_key = f"train_{basename}"
+        if train_data_key in training_history and training_history[train_data_key]:
+            train_values = training_history[train_data_key]
+            current_max_epochs_in_history = max(current_max_epochs_in_history, len(train_values))
+            epochs_train = range(1, len(train_values) + 1)
+            plt.plot(epochs_train, train_values, "bo-", label=f"Train {basename}")
+            legend_items.append(f'Training {basename}')
+            
+        val_data_key = f"val_{basename}"
+        if val_data_key in training_history and training_history[val_data_key]:
+            val_values = training_history[val_data_key]
+            current_max_epochs_in_history = max(current_max_epochs_in_history, len(val_values))
+            epochs_val = range(1, len(val_values) + 1)
+            plt.plot(epochs_val, val_values, "ro-", label=f"Val {basename}")
+            legend_items.append(f'Validation {basename}')
 
-        if f'val_{basename}' in training_history:
-            val_losses = training_history[f'val_{basename}']
-            if val_losses:
-                epochs_axis_val = range(1, len(val_losses) + 1)
-                plt.plot(epochs_axis_val, val_losses, 'ro-', label=f'Validation {basename}')
-                legend_items.append(f'Validation {basename}')
-                epochs_plotted = max(epochs_plotted, len(val_losses))
-            processed_basenames.add(basename) # Mark as processed
-        
+        if not is_train_key and not is_val_key and basename in training_history and training_history[basename]:
+            generic_values = training_history[basename]
+            current_max_epochs_in_history = max(current_max_epochs_in_history, len(generic_values))
+            epochs_generic = range(1, len(generic_values) + 1)
+            plt.plot(epochs_generic, generic_values, "go-", label=basename)
+            legend_items.append(basename)
+
+        processed_basenames.add(basename)
+
         if not legend_items:
-            if basename in training_history and training_history[basename]:
-                losses_generic = training_history[basename]
-                epochs_axis_generic = range(1, len(losses_generic) +1)
-                plt.plot(epochs_axis_generic, losses_generic, 'go-', label=basename)
-                legend_items.append(basename)
-                epochs_plotted = max(epochs_plotted, len(losses_generic))
-            else:
-                plt.close()
-                continue
+            plt.close()
+            continue
+        
+        epochs_plotted_for_any_metric = max(epochs_plotted_for_any_metric, current_max_epochs_in_history)
 
-        sanitized_basename = sanitize_filename(basename)
-        plt.title(f'{sanitized_basename} - Up to Epoch {current_epoch_completed}')
-        plt.xlabel('Epochs')
-        plt.ylabel('Loss Value')
-        if legend_items: # Add legend only if there are items to show
-            plt.legend()
+        sanitized_basename_for_file = sanitize_filename(basename)
+        plt.title(f"{basename} vs. Epochs (Latest - Epoch {current_epoch_completed})") # Titolo aggiornato
+        plt.xlabel("Epoch")
+        plt.ylabel("Value")
+        plt.legend()
         plt.grid(True)
         plt.tight_layout()
 
-        plot_filename = f"{sanitize_filename(run_name)}_epoch_{current_epoch_completed}_{sanitized_basename}.png"
+        # Save the plot with sanitized names
+        plot_filename = f"{sanitized_run_name}_{sanitized_basename_for_file}.png"
         plot_save_path = plot_output_dir / plot_filename
 
         try:
@@ -180,8 +192,8 @@ def plot_detailed_training_history(
         finally:
             plt.close()
             
-    if epochs_plotted > 0 : # If we plotted at least one graph
-        logger.info(f"Individual loss plots saved to {plot_output_dir} for epoch {current_epoch_completed}.")
+    if epochs_plotted_for_any_metric > 0:
+        logger.info(f"Latest detailed loss plots saved to {plot_output_dir} (epoch {current_epoch_completed}).")
 
 
 def get_bone_mask_for_armature(armature_class_ids: torch.Tensor,
