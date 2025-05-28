@@ -70,7 +70,7 @@ model_hyperparameters:
 
 training_hyperparameters:
   batch_size: 32
-  num_epochs: 300
+  num_epochs: 500
   learning_rate: 0.0001
   weight_decay: 0.0
   adam_beta1: 0.9
@@ -101,7 +101,7 @@ main_x0_loss_config: # Configuration for the main x0 reconstruction loss
     min_snr_gamma_value: 5.0 # Used only if scheme is "min_snr_gamma"
 
 early_stopping:
-  early_stopping_patience: 20 # Slightly increased due to longer training
+  early_stopping_patience: 30 # Slightly increased due to longer training
   early_stopping_min_delta: 0.0001
       
 # Auxiliary loss weights (conceptually aligned with MDM lambdas)

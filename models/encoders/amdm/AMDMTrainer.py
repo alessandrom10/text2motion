@@ -742,7 +742,8 @@ class ADMTrainer:
         if not (self.generate_sample_every_n_epochs > 0 and hasattr(self, 'sbert_processor_for_sampling')):
             return
 
-        logger.info(f"Generating inspection sample for epoch {epoch_num}...")
+        logger.info(f"Generating inspection sample for epoch {epoch_num} for text '{self.sample_generation_prompt}' and armature ID {self.sample_generation_armature_id}...")
+                    
         current_model_training_state = self.model.training
         self.model.eval()
 
