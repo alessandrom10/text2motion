@@ -756,7 +756,7 @@ class ADMTrainer:
             betas=betas_np,
             model_mean_type=diffusion_sampler_cfg.get('model_mean_type_mdm', 'START_X'),
             model_var_type=diffusion_sampler_cfg.get('model_var_type_mdm', 'FIXED_SMALL'),
-            loss_type="MSE", # Assuming MSE is the default loss type
+            #loss_type="MSE", # Assuming MSE is the default loss type
         )
         
         try:
