@@ -280,7 +280,7 @@ class ADMTrainer:
         """Initializes parameters for early stopping."""
         early_stop_cfg = self.args.get('early_stopping', {})
         self.early_stopping_patience = early_stop_cfg.get('early_stopping_patience', 30)
-        self.early_stopping_min_delta = early_stop_cfg.get('early_stopping_patience', 0.0001)
+        self.early_stopping_min_delta = early_stop_cfg.get('early_stopping_min_delta', 0.0001)
         self._early_stopping_counter = 0
         self._best_val_loss = float('inf')
 
@@ -427,7 +427,7 @@ class ADMTrainer:
         if self.use_kinematic_losses:
             if self.lambda_kin_vel > 0 and pred_vel.shape[1] > 0: # Check if velocity frames exist
                 mask_vel_temp = temporal_mask[..., :pred_vel.shape[1]] if temporal_mask is not None else None
-                bone_mask_vel = bone_mask[:, :pred_vel.shape[1], :]
+                bone_mask_vel = bone_mask[:, :pred_vel.shape[1], :] if bone_mask.shape[1] > pred_vel.shape[1] else bone_mask[:, :-1, :]
                 combined_mask_kin_vel = self._get_combined_mask(mask_vel_temp, bone_mask_vel, target_vel.shape)
                 loss_val = self._calculate_masked_loss(pred_vel, target_vel, combined_mask_kin_vel, self.kinematic_loss_type)
                 terms["kinematic/velocity_loss"] = loss_val.item()
@@ -435,7 +435,7 @@ class ADMTrainer:
 
             if self.lambda_kin_accel > 0 and pred_accel.shape[1] > 0: # Check if acceleration frames exist
                 mask_accel_temp = temporal_mask[..., :pred_accel.shape[1]] if temporal_mask is not None else None
-                bone_mask_accel = bone_mask[:, :pred_accel.shape[1], :]
+                bone_mask_accel = bone_mask[:, :pred_accel.shape[1], :] if bone_mask.shape[1] > pred_accel.shape[1] else bone_mask[:, :-2, :]
                 combined_mask_kin_accel = self._get_combined_mask(mask_accel_temp, bone_mask_accel, target_accel.shape)
                 loss_val = self._calculate_masked_loss(pred_accel, target_accel, combined_mask_kin_accel, self.kinematic_loss_type)
                 terms["kinematic/acceleration_loss"] = loss_val.item()
