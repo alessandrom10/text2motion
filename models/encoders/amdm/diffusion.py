@@ -1,250 +1,351 @@
-# run_generation_english.py
+"""
+Handles the diffusion sampling process for generating motion.
+Includes utilities for managing diffusion schedule parameters during sampling
+and the main generation loop that performs denoising.
+"""
 import logging
-import os
-from pathlib import Path
-import sys
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Callable, Tuple
 
 import numpy as np
 import torch
-import yaml
-from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
-current_script_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.abspath(os.path.join(current_script_dir, '..', '..', '..'))
-if project_root not in sys.path:
-    sys.path.insert(0, project_root)
-
 from AMDM import ArmatureMDM
+from torch import nn
 
-# --- Logger Setup ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - [%(name)s] - %(message)s')
 logger = logging.getLogger(__name__)
 
 
-class GaussianDiffusionSamplerUtil: # Classe helper per parametri di campionamento
-    def __init__(self, betas: np.ndarray, model_mean_type: str, model_var_type: str, loss_type: str): # Aggiunti model_mean_type etc.
-        self.betas = betas
+class GaussianDiffusionSamplerUtil:
+    """
+    Utility class to manage diffusion parameters and perform steps of the
+    reverse diffusion process (sampling), inspired by MDM's GaussianDiffusion.
+    This class assumes the model predicts x_0 (model_mean_type = "START_X").
+    """
+    def __init__(self,
+                 betas: np.ndarray,
+                 model_mean_type: str,
+                 model_var_type: str):
+        """
+        Initializes the GaussianDiffusionSamplerUtil.
+
+        :param numpy.ndarray betas: A 1D numpy array of beta values for each diffusion timestep.
+        :param str model_mean_type: Specifies what the model predicts (e.g., "START_X", "EPSILON").
+                                    This implementation primarily supports "START_X".
+        :param str model_var_type: Specifies the type of variance used during sampling
+                                   (e.g., "FIXED_SMALL", "FIXED_LARGE").
+        """
+        self.betas = betas.astype(np.float64)
         self.num_timesteps = int(betas.shape[0])
-        alphas = 1.0 - betas
+
+        alphas = 1.0 - self.betas
         self.alphas_cumprod = np.cumprod(alphas, axis=0)
         self.alphas_cumprod_prev = np.append(1.0, self.alphas_cumprod[:-1])
+
+        # For q_posterior_mean_variance (coefficients for q(x_{t-1} | x_t, x_0))
+        self.posterior_mean_coef1 = (
+            self.betas * np.sqrt(self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod + 1e-12)
+        )
+        self.posterior_mean_coef2 = (
+            (1.0 - self.alphas_cumprod_prev) * np.sqrt(alphas) / (1.0 - self.alphas_cumprod + 1e-12)
+        )
+
+        # For p_mean_variance (variance of p(x_{t-1} | x_t))
+        self.posterior_variance = (
+            self.betas * (1.0 - self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod + 1e-12)
+        )
+        # Clipped log variance to prevent log(0)
+        self.posterior_log_variance_clipped = np.log(
+            np.maximum(self.posterior_variance, 1e-20) # Clip variance at 1e-20 before log
+        )
         
-        self.sqrt_alphas_cumprod = np.sqrt(self.alphas_cumprod)
-        self.sqrt_one_minus_alphas_cumprod = np.sqrt(1.0 - self.alphas_cumprod)
+        # For _predict_xstart_from_eps (if model predicted epsilon)
         self.sqrt_recip_alphas_cumprod = np.sqrt(1.0 / self.alphas_cumprod)
         self.sqrt_recipm1_alphas_cumprod = np.sqrt(1.0 / self.alphas_cumprod - 1)
 
-        self.posterior_variance = (
-            betas * (1.0 - self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod)
-        )
-        self.posterior_log_variance_clipped = np.log(
-            np.append(self.posterior_variance[1], self.posterior_variance[1:])
-        )
-        self.posterior_mean_coef1 = (
-            betas * np.sqrt(self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod)
-        )
-        self.posterior_mean_coef2 = (
-            (1.0 - self.alphas_cumprod_prev) * np.sqrt(alphas) / (1.0 - self.alphas_cumprod)
-        )
-        # Questi dovrebbero corrispondere a ModelMeanType, ModelVarType, LossType di MDM
-        self.model_mean_type_enum = self._parse_model_mean_type(model_mean_type)
-        self.model_var_type_enum = self._parse_model_var_type(model_var_type)
-        # self.loss_type_enum = self._parse_loss_type(loss_type) # Non serve per il campionamento
-        logger.info(f"GaussianDiffusionSamplerUtil initialized for {self.num_timesteps} timesteps.")
 
-    def _parse_model_mean_type(self, mean_type_str: str):
-        if mean_type_str.upper() == "START_X": return "START_X" # Simula enum
-        elif mean_type_str.upper() == "EPSILON": return "EPSILON"
-        else: raise ValueError(f"Unknown model_mean_type: {mean_type_str}")
+        self.model_mean_type = self._parse_model_mean_type(model_mean_type)
+        self.model_var_type = self._parse_model_var_type(model_var_type)
+        
+        logger.info(f"GaussianDiffusionSamplerUtil initialized for {self.num_timesteps} timesteps. "
+                    f"ModelMeanType: {self.model_mean_type}, ModelVarType: {self.model_var_type}")
 
-    def _parse_model_var_type(self, var_type_str: str):
-        if var_type_str.upper() == "FIXED_SMALL": return "FIXED_SMALL"
-        elif var_type_str.upper() == "FIXED_LARGE": return "FIXED_LARGE"
-        else: raise ValueError(f"Unknown model_var_type: {var_type_str}")
+    def _parse_model_mean_type(self, mean_type_str: str) -> str:
+        """Parses and validates the model mean type string."""
+        valid_types = ["START_X", "EPSILON"]
+        parsed_type = mean_type_str.upper()
+        if parsed_type not in valid_types:
+            raise ValueError(f"Unknown model_mean_type: {mean_type_str}. Supported: {valid_types}")
+        if parsed_type == "EPSILON":
+            logger.warning("This sampler implementation is primarily for START_X prediction. "
+                           "Ensure model_func output is handled accordingly if EPSILON is used.")
+        return parsed_type
 
+    def _parse_model_var_type(self, var_type_str: str) -> str:
+        """Parses and validates the model variance type string."""
+        valid_types = ["FIXED_SMALL", "FIXED_LARGE"] # Add "LEARNED", "LEARNED_RANGE" if supported
+        parsed_type = var_type_str.upper()
+        if parsed_type not in valid_types:
+            raise ValueError(f"Unknown model_var_type: {var_type_str}. Supported: {valid_types}")
+        return parsed_type
 
-    def _extract_into_tensor(self, arr, timesteps, broadcast_shape):
-        # ... (come definito prima) ...
-        res = torch.from_numpy(arr).to(device=timesteps.device)[timesteps].float()
+    def _extract_into_tensor(self, arr_numpy: np.ndarray, timesteps: torch.Tensor, broadcast_shape: tuple) -> torch.Tensor:
+        """
+        Extracts values from a 1-D numpy array for a batch of timesteps and broadcasts to a target shape.
+        """
+        res = torch.from_numpy(arr_numpy).to(device=timesteps.device)[timesteps.long()].float()
         while len(res.shape) < len(broadcast_shape):
             res = res[..., None]
         return res.expand(broadcast_shape)
 
-    def _predict_xstart_from_eps(self, x_t, t, eps): # Da GaussianDiffusion
+    def _predict_xstart_from_epsilon(self, x_t: torch.Tensor, t: torch.Tensor, epsilon_pred: torch.Tensor) -> torch.Tensor:
+        """
+        Predicts x_0 from x_t and predicted epsilon, using the DDPM formula.
+        x_0 = (x_t - sqrt(1-alpha_bar_t) * eps_theta) / sqrt(alpha_bar_t)
+        """
+        assert x_t.shape == epsilon_pred.shape
         return (
             self._extract_into_tensor(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t
-            - self._extract_into_tensor(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * eps
+            - self._extract_into_tensor(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * epsilon_pred
         )
 
-    def p_mean_variance(self, model_func, x_t, t, model_kwargs=None, clip_denoised=True): # Adattato da GaussianDiffusion
-        """ Calcola la media e la varianza della p(x_{t-1} | x_t) e la predizione di x_0. """
-        if model_kwargs is None: model_kwargs = {}
-        
-        model_output_x0 = model_func(x_t, t, model_kwargs) # Il nostro modello predice x0
+    def q_posterior_mean_variance(self, x_start: torch.Tensor, x_t: torch.Tensor, t: torch.Tensor
+                                 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Computes the mean and variance of the posterior distribution q(x_{t-1} | x_t, x_0).
 
-        # Assumendo che model_output_x0 sia la predizione di x_start
-        # (dato che il tuo ArmatureMDM è progettato per predire x0)
-        if self.model_mean_type_enum != "START_X":
-             raise NotImplementedError("Sampling logic here assumes model predicts START_X (x0)")
-        
-        pred_xstart = model_output_x0
-        if clip_denoised:
-            pred_xstart = pred_xstart.clamp(-1, 1) # MDM clippa x_start
-
-        # Calcola la media della posterior q(x_{t-1} | x_t, x_0) usando la x_0 predetta
-        model_mean, _, _ = self.q_posterior_mean_variance(pred_xstart, x_t, t)
-
-        # Varianza (MDM usa FIXED_SMALL o FIXED_LARGE di solito per il campionamento)
-        if self.model_var_type_enum == "FIXED_SMALL":
-            model_variance = self._extract_into_tensor(self.posterior_variance, t, x_t.shape)
-            model_log_variance = self._extract_into_tensor(self.posterior_log_variance_clipped, t, x_t.shape)
-        elif self.model_var_type_enum == "FIXED_LARGE":
-            model_variance = self._extract_into_tensor(np.append(self.posterior_variance[1], self.betas[1:]), t, x_t.shape)
-            model_log_variance = self._extract_into_tensor(np.log(np.append(self.posterior_variance[1], self.betas[1:])), t, x_t.shape)
-        else:
-            raise NotImplementedError(f"Variance type {self.model_var_type_enum} not implemented for sampling")
-
-        return {
-            "mean": model_mean,
-            "variance": model_variance,
-            "log_variance": model_log_variance,
-            "pred_xstart": pred_xstart,
-        }
-
-    def q_posterior_mean_variance(self, x_start, x_t, t): # Da GaussianDiffusion
+        :param torch.Tensor x_start: The predicted or ground truth x_0, shape [bs, ...].
+        :param torch.Tensor x_t: The noised data at timestep t, shape [bs, ...].
+        :param torch.Tensor t: A 1D tensor of timesteps, shape [bs].
+        :return: tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                 - posterior_mean: Mean of q(x_{t-1} | x_t, x_0).
+                 - posterior_variance: Variance of q(x_{t-1} | x_t, x_0).
+                 - posterior_log_variance_clipped: Clipped log of posterior_variance.
+        """
         posterior_mean = (
             self._extract_into_tensor(self.posterior_mean_coef1, t, x_t.shape) * x_start
             + self._extract_into_tensor(self.posterior_mean_coef2, t, x_t.shape) * x_t
         )
-        # posterior_variance (calcolato in __init__)
-        # posterior_log_variance_clipped (calcolato in __init__)
-        return posterior_mean, None, None # Varianza e log_var non usate direttamente qui, prese da p_mean_variance
+        posterior_variance = self._extract_into_tensor(self.posterior_variance, t, x_t.shape)
+        posterior_log_variance_clipped = self._extract_into_tensor(self.posterior_log_variance_clipped, t, x_t.shape)
+        return posterior_mean, posterior_variance, posterior_log_variance_clipped
+
+    def p_mean_variance(self, model_fn: Callable, x_t: torch.Tensor, t: torch.Tensor,
+                        model_kwargs: Optional[Dict[str, Any]] = None,
+                        clip_denoised: bool = True) -> Dict[str, torch.Tensor]:
+        """
+        Calculates the mean and variance of the reverse process p(x_{t-1} | x_t)
+        and the model's prediction of x_0.
+
+        :param Callable model_fn: The model's forward function (takes x_t, t, model_kwargs).
+        :param torch.Tensor x_t: The current noised sample x_t.
+        :param torch.Tensor t: The current timestep t.
+        :param Optional[Dict[str, Any]] model_kwargs: Additional arguments for the model_fn.
+        :param bool clip_denoised: If True, clips the predicted x_start to [-1, 1].
+        :return: Dict[str, torch.Tensor]: A dictionary containing "mean", "variance",
+                                          "log_variance", and "pred_xstart".
+        """
+        if model_kwargs is None:
+            model_kwargs = {}
+        
+        # Model predicts x0 directly in this setup
+        pred_xstart = model_fn(x_t, t, model_kwargs)
+
+        if self.model_mean_type == "EPSILON":
+            # If model was trained to predict epsilon, convert its output to x0
+            pred_xstart = self._predict_xstart_from_epsilon(x_t, t, epsilon_pred=pred_xstart)
+            logger.debug("p_mean_variance: Converted model's epsilon prediction to x_start.")
+        elif self.model_mean_type != "START_X":
+            raise NotImplementedError(f"model_mean_type '{self.model_mean_type}' not supported for sampling in p_mean_variance.")
+
+        if clip_denoised:
+            pred_xstart = pred_xstart.clamp(-1.0, 1.0) # MDM clips x_start
+
+        # Calculate the mean of q(x_{t-1} | x_t, pred_xstart)
+        model_mean, _, model_log_variance_from_q = self.q_posterior_mean_variance(pred_xstart, x_t, t)
+
+        # Determine variance for p(x_{t-1} | x_t) based on model_var_type
+        if self.model_var_type == "FIXED_SMALL":
+            # Use the posterior variance of q(x_{t-1} | x_t, x_0) but with fixed small log variance
+            model_variance = self._extract_into_tensor(self.posterior_variance, t, x_t.shape)
+            model_log_variance = self._extract_into_tensor(self.posterior_log_variance_clipped, t, x_t.shape)
+        elif self.model_var_type == "FIXED_LARGE":
+            # Use beta_t as variance (approximation used in some DDPM variants)
+            model_variance = self._extract_into_tensor(np.append(self.posterior_variance[1], self.betas[1:]), t, x_t.shape)
+            model_log_variance = self._extract_into_tensor(np.log(np.maximum(np.append(self.posterior_variance[1], self.betas[1:]), 1e-20)), t, x_t.shape)
+        else:
+            # Add "LEARNED" or "LEARNED_RANGE" if model outputs variance
+            raise NotImplementedError(f"Variance type '{self.model_var_type}' not implemented for sampling.")
+
+        return {
+            "mean": model_mean, # Mean of p(x_{t-1} | x_t)
+            "variance": model_variance, # Variance of p(x_{t-1} | x_t)
+            "log_variance": model_log_variance, # Log variance of p(x_{t-1} | x_t)
+            "pred_xstart": pred_xstart, # Model's (clipped) prediction of x_0
+        }
 
     @torch.no_grad()
-    def p_sample_loop(self, model_func, shape, model_kwargs=None, device=None, clip_denoised=True, progress=False, const_noise=False):
-        """ Simile a GaussianDiffusion.p_sample_loop """
-        if device is None: device = next(model_func.__self__.parameters()).device # model_func è un metodo legato
+    def p_sample_loop(self,
+                      model_fn: Callable,
+                      shape: tuple,
+                      model_kwargs: Optional[Dict[str, Any]] = None,
+                      device: Optional[torch.device] = None,
+                      clip_denoised: bool = True,
+                      progress: bool = False,
+                      const_noise: bool = False,
+                      custom_initial_noise: Optional[torch.Tensor] = None
+                     ) -> torch.Tensor:
+        """
+        Generates samples from the diffusion model using the DDPM sampling loop.
+
+        :param Callable model_fn: The model's forward function.
+        :param tuple shape: The shape of the desired output tensor (batch_size, num_frames, features).
+        :param Optional[Dict[str, Any]] model_kwargs: Additional arguments for model_fn.
+        :param Optional[torch.device] device: The device to perform sampling on. If None, inferred from model.
+        :param bool clip_denoised: If True, clips the predicted x_start at each step.
+        :param bool progress: If True, displays a tqdm progress bar.
+        :param bool const_noise: If True, uses constant noise for non-zero timesteps (simplified).
+        :param Optional[torch.Tensor] custom_initial_noise: Optional custom noise to start the process.
+        :return: torch.Tensor: The generated sample (predicted x_0).
+        """
+        if device is None:
+            # Try to infer device from model_fn if it's a bound method of an nn.Module
+            if hasattr(model_fn, '__self__') and isinstance(model_fn.__self__, nn.Module):
+                device = next(model_fn.__self__.parameters()).device
+            else:
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                logger.warning(f"Device not specified and could not be inferred from model_fn. Defaulting to {device}.")
+
+        current_sample_x_t = custom_initial_noise if custom_initial_noise is not None else torch.randn(*shape, device=device)
         
-        img = torch.randn(*shape, device=device) # Immagine/moto iniziale rumoroso
-        
-        indices = list(range(self.num_timesteps))[::-1]
-        if progress: indices = tqdm(indices, desc="Sampling Loop")
+        fixed_noise_for_steps = None
+        if const_noise:
+            fixed_noise_for_steps = torch.randn_like(current_sample_x_t)
+
+        indices = list(range(self.num_timesteps))[::-1] # Iterate t from T-1 down to 0
+        if progress:
+            indices = tqdm(indices, desc="DDPM Sampling Loop")
 
         for i in indices:
-            t = torch.tensor([i] * shape[0], device=device)
+            t_batch = torch.tensor([i] * shape[0], device=device, dtype=torch.long)
             
-            # Prepara y_cond per il forward pass del modello
-            # Aggiungi CFG scale qui se necessario (MDM lo fa esternamente)
-            current_model_kwargs = model_kwargs # y_cond
+            p_sample_output = self.p_mean_variance(
+                model_fn, current_sample_x_t, t_batch,
+                model_kwargs=model_kwargs, clip_denoised=clip_denoised
+            )
+            
+            noise_for_this_step = fixed_noise_for_steps if const_noise and i != 0 else torch.randn_like(current_sample_x_t)
+            
+            # Mask to ensure no noise is added at the last step (t=0)
+            nonzero_mask = (t_batch != 0).float().view(-1, *([1] * (len(current_sample_x_t.shape) - 1)))
+            
+            current_sample_x_t = (
+                p_sample_output["mean"] +
+                nonzero_mask * torch.exp(0.5 * p_sample_output["log_variance"]) * noise_for_this_step
+            )
+            # If i == 0, current_sample_x_t is effectively p_sample_output["mean"],
+            # which should be very close to p_sample_output["pred_xstart"].
+            # MDM's p_sample_loop returns out["pred_xstart"] if i == 0.
+            # For START_X prediction, out["mean"] is derived from out["pred_xstart"], so they are closely related.
 
-            out = self.p_mean_variance(model_func, img, t, model_kwargs=current_model_kwargs, clip_denoised=clip_denoised)
-            
-            noise = torch.randn_like(img)
-            if const_noise and i != 0: # Applica solo se non è l'ultimo step e const_noise è True
-                 # Usa lo stesso rumore per tutti gli elementi del batch e mantienilo costante (o quasi)
-                 # Questa è una semplificazione. MDM ha logica più complessa se usa const_noise.
-                 # Solitamente, se const_noise, noise viene generato una volta all'inizio.
-                 # Per ora, lo ricalcoliamo ma potremmo fissarlo esternamente.
-                 # La logica MDM per const_noise in p_sample non è banale da replicare qui senza il modello completo.
-                 # Semplifichiamo: se const_noise è True, il rumore sarà lo stesso per tutti gli elementi del batch in questo step.
-                 if 'const_noise_val' not in locals() or i == indices[0]: # Genera all'inizio o se non esiste
-                     const_noise_val = torch.randn_like(img[[0]]).repeat(img.shape[0], 1, 1, 1)
-                 if i != 0 : noise = const_noise_val
+        # The final current_sample_x_t after the loop is the model's best estimate of x_0
+        # If the last step (t=0) used pred_xstart as mean and zero variance (nonzero_mask=0), this is x0.
+        # Let's return the explicit pred_xstart from the last step for clarity.
+        final_pred_xstart = p_sample_output["pred_xstart"] if 'p_sample_output' in locals() else current_sample_x_t
 
-
-            nonzero_mask = (t != 0).float().view(-1, *([1] * (len(img.shape) - 1))) # No noise at t=0
-            
-            sample = out["mean"] + nonzero_mask * torch.exp(0.5 * out["log_variance"]) * noise
-            img = sample
-            
-        return img # Questo è il predicted_x0 finale
+        return final_pred_xstart
 
 
 @torch.no_grad()
 def generate_motion_mdm_style(
-    armature_mdm_model: ArmatureMDM, # Il tuo modello ArmatureMDM (ultima versione)
-    diffusion_sampler_util: GaussianDiffusionSamplerUtil, # Oggetto per il campionamento
-    y_conditions: Dict[str, Any], # Dizionario con 'text_embeddings_batch', 'armature_class_ids', (opzionale 'mask')
-                                   # e flags per CFG: 'cfg_scale', 'uncond_text', 'uncond_armature'
+    armature_mdm_model: ArmatureMDM,
+    diffusion_sampler_util: GaussianDiffusionSamplerUtil,
+    y_conditions: Dict[str, Any],
     num_frames: int,
     device: str = 'cuda',
     clip_denoised: bool = True,
     progress: bool = True,
-    const_noise: bool = False # Se usare rumore costante (MDM ha questa opzione)
-):
+    const_noise: bool = False,
+    custom_initial_noise: Optional[torch.Tensor] = None
+) -> torch.Tensor:
     """
-    Genera un campione di movimento usando la logica di campionamento DDPM (predizione x0)
-    ispirata a MDM.
+    Generates a motion sample using the ArmatureMDM model and DDPM sampling.
+    Handles Classifier-Free Guidance (CFG) if cfg_scale is provided in y_conditions.
+
+    :param ArmatureMDM armature_mdm_model: The trained ArmatureMDM model.
+    :param GaussianDiffusionSamplerUtil diffusion_sampler_util: Utility for diffusion sampling.
+    :param Dict[str, Any] y_conditions: Dictionary of conditions, including:
+        'text_embeddings_batch': Precomputed SBERT embeddings [bs, sbert_dim].
+        'armature_class_ids': Armature IDs [bs].
+        'cfg_scale' (Optional): Classifier-Free Guidance scale. If > 1.0, CFG is applied.
+        'uncond_text' (Optional, for CFG): Force text to be unconditional.
+        'uncond_armature' (Optional, for CFG): Force armature to be unconditional.
+    :param int num_frames: The number of frames to generate for the motion.
+    :param str device: The device to perform generation on ('cuda' or 'cpu').
+    :param bool clip_denoised: If True, clips the predicted x_start at each step.
+    :param bool progress: If True, displays a tqdm progress bar for the sampling loop.
+    :param bool const_noise: If True, uses constant noise for non-zero timesteps (simplified).
+    :param Optional[torch.Tensor] custom_initial_noise: Optional custom noise to start the process.
+    :return: torch.Tensor: The generated motion tensor (predicted x_0),
+                           shape [batch_size, num_frames, num_motion_features].
     """
     armature_mdm_model.eval()
     armature_mdm_model.to(device)
 
     batch_size = y_conditions['text_embeddings_batch'].shape[0]
-    num_motion_features = armature_mdm_model.input_feats # Dal modello
+    # Assuming model has input_feats attribute correctly set
+    num_motion_features = getattr(armature_mdm_model, 'input_feats', 66) # Fallback if not present
 
-    shape = (batch_size, num_frames, num_motion_features) # Attenzione: ArmatureMDM internamente permuta a [nfr, bs, feat]
-                                                        # ma il suo input/output esterno è [bs, nfr, feat]
+    output_shape = (batch_size, num_frames, num_motion_features)
 
-    # --- Classifier-Free Guidance (CFG) ---
-    # MDM la implementa avvolgendo il modello in ClassifierFreeSampleModel.
-    # Qui, la simuliamo passando y_cond due volte al modello se cfg_scale > 1.
-    cfg_scale = y_conditions.get('cfg_scale', 1.0) # Default a 1.0 (no CFG o condizionale puro)
+    cfg_scale = y_conditions.get('cfg_scale', 1.0)
 
-    if cfg_scale != 1.0:
-        # Prepara y_cond per la predizione condizionata
-        y_cond_input = {k: v for k, v in y_conditions.items() if k != 'cfg_scale'}
-        y_cond_input['uncond'] = False # Flag per il modello
-        y_cond_input['uncond_text'] = False
-        y_cond_input['uncond_armature'] = False
+    model_fn_for_sampling: Callable
+    final_model_kwargs_for_sampling: Dict[str, Any]
 
-        # Prepara y_uncond per la predizione incondizionata
-        y_uncond_input = {k: v for k, v in y_conditions.items() if k != 'cfg_scale'}
-        y_uncond_input['uncond'] = True # Flag per il modello
-        y_uncond_input['uncond_text'] = True # Maschera testo
-        y_uncond_input['uncond_armature'] = True # Maschera armatura
-        
-        # Funzione modello che internamente gestisce CFG
-        def model_fn_cfg(x_t, t, y_private_cond): # y_private_cond è il dizionario di condizioni specifico
-            # y_private_cond non conterrà cfg_scale, è già gestito qui
-            return armature_mdm_model(x_t, t, y_private_cond)
+    if cfg_scale != 1.0 and cfg_scale > 0: # CFG is active
+        logger.info(f"Applying Classifier-Free Guidance with scale: {cfg_scale}")
+        # Conditional pass setup
+        y_cond_pass = {k: v for k, v in y_conditions.items() if k != 'cfg_scale'}
+        y_cond_pass['uncond'] = False # Explicitly conditional
+        y_cond_pass['uncond_text'] = False
+        y_cond_pass['uncond_armature'] = False
 
-        def combined_model_fn(x_t, t, _): # L'ultimo arg non usato, le y sono catturate dallo scope
-            out_cond = model_fn_cfg(x_t, t, y_cond_input)
-            out_uncond = model_fn_cfg(x_t, t, y_uncond_input)
+        # Unconditional pass setup
+        y_uncond_pass = {k: v for k, v in y_conditions.items() if k != 'cfg_scale'}
+        y_uncond_pass['uncond'] = True # Global unconditional flag
+        y_uncond_pass['uncond_text'] = True # Force unconditional text
+        y_uncond_pass['uncond_armature'] = True # Force unconditional armature
+
+        def cfg_model_fn(x_t_cfg: torch.Tensor, t_cfg: torch.Tensor, y_ignored_kwargs: Dict[str,Any]) -> torch.Tensor:
+            # y_ignored_kwargs is not used here because y_cond_pass and y_uncond_pass are captured
+            # This matches how MDM's ClassifierFreeSampleModel works by wrapping the model.
+            out_cond = armature_mdm_model(x_t_cfg, t_cfg, y_cond_pass)
+            out_uncond = armature_mdm_model(x_t_cfg, t_cfg, y_uncond_pass)
             return out_uncond + cfg_scale * (out_cond - out_uncond)
         
-        model_to_sample_from = combined_model_fn
-        # model_kwargs per p_sample_loop non serviranno per 'y' perché catturate in combined_model_fn
-        final_model_kwargs = {} 
+        model_fn_for_sampling = cfg_model_fn
+        final_model_kwargs_for_sampling = {} # kwargs are handled inside cfg_model_fn
+    else: # No CFG or purely conditional generation
+        logger.info("Generating with conditional model (CFG scale <= 1.0 or not applied).")
+        y_input_direct = {k: v for k, v in y_conditions.items() if k != 'cfg_scale'}
+        y_input_direct['uncond'] = False # Default to conditional
+        y_input_direct['uncond_text'] = y_conditions.get('uncond_text', False)
+        y_input_direct['uncond_armature'] = y_conditions.get('uncond_armature', False)
+        
+        # Lambda to match the expected signature for model_fn in p_sample_loop
+        model_fn_for_sampling = lambda x_t_lambda, t_lambda, y_lambda_cond: armature_mdm_model(x_t_lambda, t_lambda, y_lambda_cond)
+        final_model_kwargs_for_sampling = y_input_direct
 
-    else: # No CFG o cfg_scale = 1.0 (solo condizionale)
-        y_cond_input = {k: v for k, v in y_conditions.items() if k != 'cfg_scale'}
-        y_cond_input['uncond'] = False
-        y_cond_input['uncond_text'] = y_conditions.get('uncond_text', False)
-        y_cond_input['uncond_armature'] = y_conditions.get('uncond_armature', False)
-
-        # model_to_sample_from = armature_mdm_model.forward # Passa direttamente il metodo forward
-        # Questo non funziona perché .forward non è legato all'istanza in questo modo.
-        # Creiamo una lambda.
-        model_to_sample_from = lambda x_t, t, y_lambda_cond: armature_mdm_model(x_t, t, y_lambda_cond)
-        final_model_kwargs = y_cond_input
-
-
-    # Esegui il loop di campionamento
-    # `p_sample_loop` di diffusion_sampler_util si aspetta che model_func sia una funzione
-    # che prende (x_t, t, model_kwargs) e restituisce la predizione di x0.
-    # La nostra `combined_model_fn` o la lambda per `armature_mdm_model` fanno questo.
     generated_motion = diffusion_sampler_util.p_sample_loop(
-        model_func=model_to_sample_from,
-        shape=shape,
-        model_kwargs=final_model_kwargs, # Passa il dizionario y corretto
-        device=device,
+        model_fn=model_fn_for_sampling,
+        shape=output_shape,
+        model_kwargs=final_model_kwargs_for_sampling,
+        device=torch.device(device),
         clip_denoised=clip_denoised,
         progress=progress,
-        const_noise=const_noise
+        const_noise=const_noise,
+        custom_initial_noise=custom_initial_noise
     )
-    # L'output di p_sample_loop è già il predicted_x0 finale, forma [bs, num_frames, features]
     
-    logger.info(f"Generazione completata. Shape output: {generated_motion.shape}")
+    logger.info(f"Motion generation complete. Output shape: {generated_motion.shape}")
     return generated_motion

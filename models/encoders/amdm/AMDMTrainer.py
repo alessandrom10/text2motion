@@ -1,49 +1,119 @@
+"""
+Training loop and utilities for ArmatureMDM.
+"""
+import os
+import math
+import logging
+from typing import Dict, Any, Callable, List, Optional, Tuple
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from typing import Dict, Any, Callable, List, Optional, Tuple
-import logging
-import numpy as np
 from tqdm import tqdm
-import os
-import math
+from pathlib import Path
+from AMDM import ArmatureMDM
+from sentence_transformers import SentenceTransformer
 
-from AMDM import ArmatureMDM # Aggiunto per math.ceil
+from diffusion import generate_motion_mdm_style, GaussianDiffusionSamplerUtil
+from utils.diffusion_utils import create_motion_animation, T2M_KINEMATIC_CHAIN
 
-# Assumiamo che ArmatureMDM (l'ultima versione allineata) e le sue dipendenze
-# (PositionalEncoding, TimestepEmbedder, InputProcessMDM, OutputProcessMDM)
-# siano definite qui o importate correttamente.
-# from your_model_file import ArmatureMDM, PositionalEncoding, TimestepEmbedder, InputProcessMDM, OutputProcessMDM
 
 logger = logging.getLogger(__name__)
 
-def mean_flat(tensor): # Da diffusion.nn
-    """Take the mean over all non-batch dimensions."""
+def mean_flat(tensor: torch.Tensor) -> torch.Tensor:
+    """
+    Takes the mean over all non-batch dimensions.
+    Equivalent to diffusion.nn.mean_flat from MDM.
+
+    :param torch.Tensor tensor: The input tensor.
+    :return: torch.Tensor: The mean over non-batch dimensions.
+    """
     return tensor.mean(dim=list(range(1, len(tensor.shape))))
 
-class UniformSampler: # Semplice UniformSampler da diffusion.resample
-    def __init__(self, diffusion_process_obj):
+def get_named_beta_schedule(schedule_name: str, num_diffusion_timesteps: int, scale_betas: float = 1.0) -> np.ndarray:
+    """
+    Returns a beta schedule based on the specified name and number of diffusion timesteps.
+    This is a simplified version of diffusion.get_named_beta_schedule from MDM.
+    :param str schedule_name: The name of the beta schedule (e.g., "linear", "cosine").
+    :param int num_diffusion_timesteps: The number of diffusion timesteps.
+    :param float scale_betas: A scaling factor for the beta values.
+    :return: numpy.ndarray: A 1D numpy array of beta values for the specified schedule.
+    """
+    if schedule_name == "linear":
+        scale = scale_betas * 1000 / num_diffusion_timesteps
+        beta_start = scale * 0.0001
+        beta_end = scale * 0.02
+        return np.linspace(
+            beta_start, beta_end, num_diffusion_timesteps, dtype=np.float64
+        )
+    elif schedule_name == "cosine":
+        def betas_for_alpha_bar(num_diffusion_timesteps_inner, alpha_bar_fn, max_beta=0.999): #
+            betas_out = []
+            for i in range(num_diffusion_timesteps_inner):
+                t1 = i / num_diffusion_timesteps_inner
+                t2 = (i + 1) / num_diffusion_timesteps_inner
+                betas_out.append(min(1 - alpha_bar_fn(t2) / alpha_bar_fn(t1), max_beta))
+            return np.array(betas_out)
+
+        return betas_for_alpha_bar(
+            num_diffusion_timesteps,
+            lambda t: math.cos((t + 0.008) / 1.008 * math.pi / 2) ** 2, #
+        )
+    else:
+        raise NotImplementedError(f"unknown beta schedule: {schedule_name}")
+
+class UniformSampler:
+    """
+    A simple schedule sampler that samples timesteps uniformly.
+    Similar to diffusion.resample.UniformSampler from MDM.
+
+    :param diffusion_process_obj: An object that has a 'num_timesteps' attribute.
+    """
+    def __init__(self, diffusion_process_obj: Any):
         self.diffusion = diffusion_process_obj
-        # Assumiamo che diffusion_process_obj.num_timesteps esista
         self._weights = np.ones([getattr(self.diffusion, 'num_timesteps', 1000)])
 
-    def weights(self):
+    def weights(self) -> np.ndarray:
+        """
+        Returns the weights for each diffusion timestep. For uniform sampling, these are all ones.
+        :return: numpy.ndarray: Array of weights.
+        """
         return self._weights
 
-    def sample(self, batch_size, device):
+    def sample(self, batch_size: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Importance-samples timesteps for a batch.
+
+        :param int batch_size: The number of timesteps to sample.
+        :param torch.device device: The torch device to create tensors on.
+        :return: tuple[torch.Tensor, torch.Tensor]:
+                 - timesteps: A tensor of timestep indices.
+                 - weights: A tensor of weights to scale the resulting losses (inverse probability).
+        """
         w = self.weights()
         p = w / np.sum(w)
         indices_np = np.random.choice(len(p), size=(batch_size,), p=p)
         indices = torch.from_numpy(indices_np).long().to(device)
-        weights_np = 1 / (len(p) * p[indices_np])
+        weights_np = 1 / (len(p) * p[indices_np]) # For unbiased loss
         weights_pt = torch.from_numpy(weights_np).float().to(device)
         return indices, weights_pt
 
 
-class GaussianDiffusionTrainerUtil: # Classe helper per parametri di diffusione
+class GaussianDiffusionTrainerUtil:
+    """
+    Helper class to store and provide diffusion schedule parameters (betas, alphas, etc.)
+    and the q_sample method, needed for the training loop.
+    Inspired by diffusion.gaussian_diffusion.GaussianDiffusion from MDM.
+    """
     def __init__(self, betas: np.ndarray):
+        """
+        Initializes the diffusion utility with a precomputed beta schedule.
+
+        :param numpy.ndarray betas: A 1D numpy array of beta values for each diffusion timestep.
+        """
         self.betas = betas
         self.num_timesteps = int(betas.shape[0])
 
@@ -51,89 +121,124 @@ class GaussianDiffusionTrainerUtil: # Classe helper per parametri di diffusione
         self.alphas_cumprod = np.cumprod(alphas, axis=0)
         self.sqrt_alphas_cumprod = np.sqrt(self.alphas_cumprod)
         self.sqrt_one_minus_alphas_cumprod = np.sqrt(1.0 - self.alphas_cumprod)
-        # ... (altri parametri necessari da GaussianDiffusion se usati)
         logger.info(f"GaussianDiffusionTrainerUtil initialized with {self.num_timesteps} timesteps.")
 
-    def q_sample(self, x_start, t, noise=None): # Da GaussianDiffusion.q_sample
+    def _extract_into_tensor(self, arr: np.ndarray, timesteps: torch.Tensor, broadcast_shape: tuple) -> torch.Tensor:
+        """
+        Extracts values from a 1-D numpy array for a batch of indices and broadcasts to a target shape.
+        Helper function from MDM's diffusion.gaussian_diffusion.
+        """
+        res = torch.from_numpy(arr).to(device=timesteps.device)[timesteps.long()].float()
+        while len(res.shape) < len(broadcast_shape):
+            res = res[..., None]
+        return res.expand(broadcast_shape)
+
+    def q_sample(self, x_start: torch.Tensor, t: torch.Tensor, noise: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Diffuses the data for a given number of diffusion steps. q(x_t | x_0).
+        From MDM's diffusion.gaussian_diffusion.GaussianDiffusion.
+
+        :param torch.Tensor x_start: The initial clean data batch, shape [bs, num_frames, features].
+        :param torch.Tensor t: A 1D tensor of timesteps (batch_size,).
+        :param Optional[torch.Tensor] noise: Optional noise tensor. If None, generated randomly.
+        :return: torch.Tensor: The noised version of x_start at timesteps t.
+        """
         if noise is None:
             noise = torch.randn_like(x_start)
         assert noise.shape == x_start.shape
-        
-        # _extract_into_tensor è una funzione helper in MDM. La replichiamo qui per semplicità.
-        def _extract_into_tensor(arr, timesteps, broadcast_shape):
-            res = torch.from_numpy(arr).to(device=timesteps.device)[timesteps].float()
-            while len(res.shape) < len(broadcast_shape):
-                res = res[..., None]
-            return res.expand(broadcast_shape)
-
         return (
-            _extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
-            + _extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape)
+            self._extract_into_tensor(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
+            + self._extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape)
             * noise
         )
 
-class ArmatureMDMTrainerRevised:
+
+class ADMTrainer:
+    """
+    Trainer class for the ArmatureMDM model, aligned with MDM's training loop concepts.
+    Handles the training loop, loss calculations (including armature bone masking),
+    model saving, evaluation, and optional sample generation during training.
+    """
     def __init__(self,
                  config: Dict[str, Any],
-                 model: ArmatureMDM, # La tua ArmatureMDM (ultima versione)
-                 diffusion_util: GaussianDiffusionTrainerUtil, # Oggetto per q_sample e parametri beta/alpha
+                 model: ArmatureMDM,
+                 diffusion_util: GaussianDiffusionTrainerUtil,
                  train_loader: DataLoader,
                  get_bone_mask_fn: Callable[..., torch.Tensor],
-                 armature_config_data: Optional[Dict] = None,
+                 model_save_dir: Path, # Expects the full Path object now
+                 armature_config_data: Optional[Dict[str, Any]] = None,
                  val_loader: Optional[DataLoader] = None,
-                 # Parametri aggiuntivi che erano nel tuo TrainerMDM originale
-                 lr_scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None 
+                 lr_scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None
                 ):
+        """
+        Initializes the ArmatureMDMTrainerRevised.
 
-        self.args = config # Salva l'intera configurazione
+        :param Dict[str, Any] config: The full configuration dictionary.
+        :param ArmatureMDM model: The ArmatureMDM model instance to be trained.
+        :param GaussianDiffusionTrainerUtil diffusion_util: Utility object for diffusion parameters and q_sample.
+        :param DataLoader train_loader: DataLoader for the training data.
+        :param Callable get_bone_mask_fn: Function to generate a bone mask based on armature IDs.
+        :param Path model_save_dir: The full Path object to the directory where models and logs for this run will be saved.
+        :param Optional[Dict[str, Any]] armature_config_data: Configuration data for armatures (e.g., bone definitions).
+        :param Optional[DataLoader] val_loader: DataLoader for the validation data.
+        :param Optional[torch.optim.lr_scheduler._LRScheduler] lr_scheduler: Learning rate scheduler.
+        """
+        self.args = config
         self.model = model
-        self.diffusion_util = diffusion_util # Oggetto che gestisce i parametri di diffusione
+        self.diffusion_util = diffusion_util
         self.data_loader = train_loader
         self.val_data_loader = val_loader
         self.get_bone_mask_fn = get_bone_mask_fn
         self.armature_config_data = armature_config_data
         self.lr_scheduler = lr_scheduler
 
-        # Training hyperparameters (allineati a MDM e alla tua config)
         train_cfg = self.args.get('training_hyperparameters', {})
-        self.batch_size = train_cfg.get('batch_size', 32)
-        self.lr = train_cfg.get('learning_rate', 1e-4)
-        self.weight_decay = train_cfg.get('weight_decay', 0.0)
-        self.adam_beta1 = train_cfg.get('adam_beta1', 0.9) # Valore comune
-        self.adam_beta2 = train_cfg.get('adam_beta2', 0.999)
-        self.num_epochs = train_cfg.get('num_epochs', 200) # Aumentato come suggerito
-        
-        self.log_interval_epochs = train_cfg.get('log_interval_epochs', 1) # Log a fine epoca
-        self.save_interval_epochs = train_cfg.get('save_interval_epochs', 10) # Salva ogni N epoche
-        
-        self.cfg_drop_prob_trainer = train_cfg.get('cfg_drop_prob_trainer', 0.15)
-
         paths_cfg = self.args.get('paths', {})
-        self.model_save_dir = paths_cfg.get('model_save_dir', './save')
-        self.model_filename_base = paths_cfg.get('model_filename', 'armature_mdm_trained.pth').replace('.pth', '')
-        os.makedirs(self.model_save_dir, exist_ok=True)
-
-        self.current_epoch = 0
-        self.completed_steps = 0 # Contatore di step totali se vuoi loggare/salvare per step
+        model_cfg = self.args.get('model_hyperparameters', {})
 
         self.device = torch.device(train_cfg.get('device', 'cuda' if torch.cuda.is_available() else 'cpu'))
         self.model.to(self.device)
 
+        self.lr = train_cfg.get('learning_rate', 1e-4)
+        self.weight_decay = train_cfg.get('weight_decay', 0.0)
+        self.adam_beta1 = train_cfg.get('adam_beta1', 0.9)
+        self.adam_beta2 = train_cfg.get('adam_beta2', 0.999)
         self.opt = optim.AdamW(
-            self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay, betas=(self.adam_beta1, self.adam_beta2)
+            self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay,
+            betas=(self.adam_beta1, self.adam_beta2)
         )
+        if self.lr_scheduler is not None: # If scheduler was created with a temp optimizer
+            self.lr_scheduler.optimizer = self.opt
 
-        # Schedule Sampler (Uniforme per semplicità, come in MDM TrainingLoop)
+        self.num_epochs = train_cfg.get('num_epochs', 300)
+        self.cfg_drop_prob_trainer = train_cfg.get('cfg_drop_prob_trainer', 0.15)
+        
+        self.model_save_dir = model_save_dir # This is now a Path object
+        self.model_filename_base = paths_cfg.get('model_filename', 'armature_mdm_checkpoint.pth').replace('.pth', '')
+        self.best_model_save_path = self.model_save_dir / f"{self.model_filename_base}_best.pth"
+
+
+        self.current_epoch = 0
+        self.completed_steps = 0
+
         self.schedule_sampler = UniformSampler(self.diffusion_util)
-
-        # Configurazione Loss
         self.main_loss_type = train_cfg.get('main_loss_type_trainer', "mse")
+        
+        self._initialize_loss_weighting()
+        self._initialize_aux_loss_params()
+        self._initialize_early_stopping()
+        self._initialize_sample_generation_params(train_cfg, model_cfg)
+
+        logger.info("ArmatureMDMTrainerRevised initialized.")
+        # Log key parameters
+
+    def _initialize_loss_weighting(self):
+        """Initializes parameters for timestep loss weighting."""
         main_x0_loss_cfg = self.args.get('main_x0_loss_config', {})
         self.loss_weighting_scheme = main_x0_loss_cfg.get('timestep_weighting', {}).get('scheme', 'none')
         self.min_snr_gamma_value = main_x0_loss_cfg.get('min_snr_gamma_value', 5.0)
-        
+
         if self.loss_weighting_scheme != "none":
-            # Precalcola valori SNR se necessario per la pesatura (come nel tuo trainer originale)
             diff_hyperparams = self.args.get('diffusion_hyperparameters', {})
             beta_start = diff_hyperparams.get('beta_start', 0.0001)
             beta_end = diff_hyperparams.get('beta_end', 0.02)
@@ -145,8 +250,11 @@ class ArmatureMDMTrainerRevised:
             if self.loss_weighting_scheme in ["snr_plus_one", "min_snr_gamma"]:
                 self.snr_for_loss_weighting = self.alphas_cumprod_for_loss_weighting / \
                                              (1.0 - self.alphas_cumprod_for_loss_weighting + 1e-8)
+        logger.info(f"Main loss: {self.main_loss_type}, Timestep weighting: {self.loss_weighting_scheme}")
 
-        # Pesi Loss Ausiliarie (dalla tua config)
+
+    def _initialize_aux_loss_params(self):
+        """Initializes parameters for auxiliary kinematic and geometric losses."""
         kin_cfg = self.args.get('kinematic_losses', {})
         self.use_kinematic_losses = kin_cfg.get('use_kinematic_losses', False)
         self.lambda_kin_vel = kin_cfg.get('velocity_loss_weight', 0.0)
@@ -156,29 +264,52 @@ class ArmatureMDMTrainerRevised:
         geom_cfg = self.args.get('mdm_geometric_losses', {})
         self.use_mdm_geometric_losses = geom_cfg.get('use_mdm_geometric_losses', False)
         self.lambda_geom_pos = geom_cfg.get('lambda_pos', 0.0)
-        self.lambda_geom_vel = geom_cfg.get('lambda_vel', 0.1) # Default aumentato
+        self.lambda_geom_vel = geom_cfg.get('lambda_vel', 0.1)
         self.lambda_geom_foot = geom_cfg.get('lambda_foot', 0.0)
-        self.foot_joint_indices = geom_cfg.get('foot_joint_indices', [10, 11]) # Esempio
+        self.foot_joint_indices = geom_cfg.get('foot_joint_indices', [])
         
         model_hyperparams = self.args.get('model_hyperparameters', {})
         self.num_joints_for_geom = model_hyperparams.get('num_joints_for_geom', 22)
         self.features_per_joint_for_geom = model_hyperparams.get('features_per_joint_for_geom', 3)
-
-        # Early stopping
-        early_stop_cfg = self.args.get('early_stopping', {})
-        self.early_stopping_patience = early_stop_cfg.get('early_stopping_patience', 10)
-        self.early_stopping_min_delta = early_stop_cfg.get('early_stopping_min_delta', 0.0001)
-        self._early_stopping_counter = 0
-        self._best_val_loss = float('inf')
-        self.model_save_path = os.path.join(self.model_save_dir, f"{self.model_filename_base}_best.pth")
-
-        logger.info("ArmatureMDMTrainerRevised initialized.")
-        logger.info(f"Main loss: {self.main_loss_type}, Timestep weighting: {self.loss_weighting_scheme}")
         logger.info(f"Kinematic losses: Use={self.use_kinematic_losses}, Vel_w={self.lambda_kin_vel}, Accel_w={self.lambda_kin_accel}")
         logger.info(f"Geometric losses: Use={self.use_mdm_geometric_losses}, Pos_w={self.lambda_geom_pos}, Vel_w={self.lambda_geom_vel}, Foot_w={self.lambda_geom_foot}")
 
+    def _initialize_early_stopping(self):
+        """Initializes parameters for early stopping."""
+        early_stop_cfg = self.args.get('early_stopping', {})
+        self.early_stopping_patience = early_stop_cfg.get('patience', 10) # Renamed from config
+        self.early_stopping_min_delta = early_stop_cfg.get('min_delta', 0.0001) # Renamed
+        self._early_stopping_counter = 0
+        self._best_val_loss = float('inf')
+
+    def _initialize_sample_generation_params(self, train_cfg, model_cfg):
+        """Initializes parameters for sample generation during training."""
+        self.generate_sample_every_n_epochs = train_cfg.get('generate_sample_every_n_epochs', 0)
+        if self.generate_sample_every_n_epochs > 0:
+            self.sample_generation_prompt = train_cfg.get('sample_generation_prompt', "a person walks")
+            self.sample_generation_armature_id = train_cfg.get('sample_generation_armature_id', 1)
+            self.sample_generation_num_frames = train_cfg.get('sample_generation_num_frames', 100)
+            self.sample_generation_cfg_scale = train_cfg.get('sample_generation_cfg_scale', 2.5)
+            
+            # Output directory for samples is within the run's model_save_dir
+            self.sample_generation_output_dir = self.model_save_dir / "training_samples"
+            self.sample_generation_output_dir.mkdir(parents=True, exist_ok=True)
+
+            sbert_model_name_cfg = model_cfg.get('sbert_model_name')
+            if sbert_model_name_cfg:
+                logger.info(f"Initializing SBERT model ('{sbert_model_name_cfg}') for sample generation...")
+                try:
+                    self.sbert_processor_for_sampling = SentenceTransformer(sbert_model_name_cfg, device=self.device)
+                except Exception as e:
+                    logger.error(f"Failed to load SBERT for sampling: {e}. Disabling sample generation.")
+                    self.generate_sample_every_n_epochs = 0
+            else:
+                logger.warning("SBERT model name not in config for sample generation. Disabling it.")
+                self.generate_sample_every_n_epochs = 0
+        logger.info(f"Sample generation during training: {'ENABLED every ' + str(self.generate_sample_every_n_epochs) + ' epochs' if self.generate_sample_every_n_epochs > 0 else 'DISABLED'}.")
 
     def _get_timestep_loss_weights(self, timesteps: torch.Tensor) -> torch.Tensor:
+        """ Returns the loss weights for each timestep based on the configured scheme. """
         if self.loss_weighting_scheme == "none" or not hasattr(self, 'alphas_cumprod_for_loss_weighting'):
             return torch.ones_like(timesteps, dtype=torch.float32, device=self.device)
         long_timesteps = timesteps.long()
@@ -191,98 +322,94 @@ class ArmatureMDMTrainerRevised:
         else:
             logger.warning(f"Unknown weighting scheme '{self.loss_weighting_scheme}'. Defaulting to ones.")
             return torch.ones_like(timesteps, dtype=torch.float32, device=self.device)
-        return weights / (weights.mean() + 1e-8) # Normalize
+        normalized_weights = weights / (weights.mean() + 1e-8)
+        return normalized_weights
 
-    def _get_combined_mask(self, temporal_mask, bone_mask, target_shape):
-        bs, nframes, nfeatures = target_shape[0], target_shape[1], target_shape[2]
-        if temporal_mask is not None: # temporal_mask: [bs,1,1,nfr_orig_tempo], True=valido
-            current_nframes_in_mask = temporal_mask.shape[-1]
-            # Adatta la maschera temporale alla lunghezza corrente (es. per velocità/accel)
-            safe_nframes = min(nframes, current_nframes_in_mask)
-            processed_temporal_mask = temporal_mask[..., :safe_nframes].squeeze(1).permute(0, 2, 1)[:,:nframes,:] # -> [bs, nframes, 1]
+
+    def _get_combined_mask(self, temporal_mask: Optional[torch.Tensor], bone_mask: torch.Tensor, target_shape: tuple) -> torch.Tensor:
+        """ Combines temporal and bone masks to create a final mask for loss calculations. """
+        bs, nframes_current, nfeatures = target_shape[0], target_shape[1], target_shape[2]
+
+        if temporal_mask is not None:
+            # Ensure temporal_mask is boolean and True means valid
+            processed_temporal_mask = temporal_mask.squeeze(1).squeeze(1) # -> [bs, nframes_orig_tempo]
+            # Slice or pad temporal_mask to match nframes_current
+            if processed_temporal_mask.shape[1] > nframes_current:
+                processed_temporal_mask = processed_temporal_mask[:, :nframes_current]
+            elif processed_temporal_mask.shape[1] < nframes_current:
+                padding = torch.zeros(bs, nframes_current - processed_temporal_mask.shape[1],
+                                      dtype=torch.bool, device=processed_temporal_mask.device)
+                processed_temporal_mask = torch.cat((processed_temporal_mask, padding), dim=1)
+            processed_temporal_mask = processed_temporal_mask.unsqueeze(-1) # -> [bs, nframes_current, 1]
         else:
-            processed_temporal_mask = torch.ones(bs, nframes, 1, device=bone_mask.device, dtype=torch.bool)
+            processed_temporal_mask = torch.ones(bs, nframes_current, 1, device=bone_mask.device, dtype=torch.bool)
         
-        # bone_mask: [bs, nfr_orig_bone, nfeatures], 1.0=attivo. Adatta nfr_orig_bone a nframes.
-        safe_nframes_bone = min(nframes, bone_mask.shape[1])
-        processed_bone_mask = bone_mask[:, :safe_nframes_bone, :].bool() # -> [bs, nframes, nfeatures]
-
-        # Estendi la maschera più corta se necessario
-        if processed_temporal_mask.shape[1] > processed_bone_mask.shape[1]: # Se bone_mask è più corta (improbabile)
-            padding = torch.zeros(bs, processed_temporal_mask.shape[1] - processed_bone_mask.shape[1], nfeatures,
+        # Ensure bone_mask is boolean and True means active, and slice/pad frames
+        processed_bone_mask = bone_mask.bool() # Assuming bone_mask comes as float 0/1
+        if processed_bone_mask.shape[1] > nframes_current:
+            processed_bone_mask = processed_bone_mask[:, :nframes_current, :]
+        elif processed_bone_mask.shape[1] < nframes_current:
+            padding = torch.zeros(bs, nframes_current - processed_bone_mask.shape[1], nfeatures,
                                   dtype=torch.bool, device=bone_mask.device)
             processed_bone_mask = torch.cat((processed_bone_mask, padding), dim=1)
-        elif processed_bone_mask.shape[1] > processed_temporal_mask.shape[1]: # Se temporal_mask è più corta
-             padding = torch.zeros(bs, processed_bone_mask.shape[1] - processed_temporal_mask.shape[1], 1,
-                                  dtype=torch.bool, device=bone_mask.device)
-             processed_temporal_mask = torch.cat((processed_temporal_mask, padding), dim=1)
+        
+        # Combine: True if both temporal is valid AND bone is active
+        combined_mask = processed_temporal_mask & processed_bone_mask # Element-wise AND
+        return combined_mask.float() # Return as float (0.0 or 1.0) for multiplication
 
-
-        combined_mask_float = processed_temporal_mask.float() * processed_bone_mask.float()
-        return combined_mask_float
-
-    def _calculate_masked_loss(self, prediction, target, combined_mask, loss_type, sample_timestep_weights=None):
-        if loss_type == "mse":
+    def _calculate_masked_loss(self, prediction: torch.Tensor, target: torch.Tensor,
+                               combined_mask: torch.Tensor, loss_type: str,
+                               sample_timestep_weights: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """ Calculates the masked loss between prediction and target tensors. """
+        if loss_type.lower() == "mse":
             element_wise_loss = F.mse_loss(prediction, target, reduction='none')
-        elif loss_type == "l1":
+        elif loss_type.lower() == "l1":
             element_wise_loss = F.l1_loss(prediction, target, reduction='none')
         else:
-            raise ValueError(f"Unsupported loss_type: {loss_type}")
+            raise ValueError(f"Unsupported loss_type: {loss_type}. Choose 'mse' or 'l1'.")
         
-        # Assicurati che combined_mask abbia le stesse dimensioni spaziali/feature di element_wise_loss
-        # element_wise_loss è [bs, nframes, nfeatures]
-        # combined_mask è [bs, nframes, nfeatures]
         masked_element_wise_loss = element_wise_loss * combined_mask
-        
         sum_loss_per_sample = masked_element_wise_loss.sum(dim=list(range(1, masked_element_wise_loss.ndim)))
         num_active_elements_per_sample = combined_mask.sum(dim=list(range(1, combined_mask.ndim)))
-        
-        num_active_per_sample_safe = torch.clamp(num_active_elements_per_sample, min=1e-8)
-        mean_loss_per_sample = sum_loss_per_sample / num_active_per_sample_safe
-        
-        is_inactive_sample = (num_active_elements_per_sample == 0)
-        mean_loss_per_sample[is_inactive_sample] = 0.0
+        num_active_safe = torch.clamp(num_active_elements_per_sample, min=1e-8)
+        mean_loss_per_sample = sum_loss_per_sample / num_active_safe
+        mean_loss_per_sample[num_active_elements_per_sample == 0] = 0.0
 
         if sample_timestep_weights is not None:
             weighted_loss_per_sample = mean_loss_per_sample * sample_timestep_weights
         else:
             weighted_loss_per_sample = mean_loss_per_sample
-            
-        final_batch_loss = weighted_loss_per_sample.mean()
-        return final_batch_loss
+        return weighted_loss_per_sample.mean()
 
-    def _get_derivatives(self, motion_sequence: torch.Tensor):
-        # motion_sequence: [bs, nframes, nfeatures]
+    def _get_derivatives(self, motion_sequence: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """ Computes the velocity and acceleration of a motion sequence. """
         vel = torch.empty(motion_sequence.shape[0], 0, motion_sequence.shape[2], device=motion_sequence.device, dtype=motion_sequence.dtype)
         accel = torch.empty(motion_sequence.shape[0], 0, motion_sequence.shape[2], device=motion_sequence.device, dtype=motion_sequence.dtype)
-
         if motion_sequence.shape[1] >= 2:
             vel = motion_sequence[:, 1:] - motion_sequence[:, :-1]
             if vel.shape[1] >= 2:
                 accel = vel[:, 1:] - vel[:, :-1]
         return vel, accel
 
-    def _compute_losses_dict(self, x_start_gt, predicted_x0, t, y_cond, bone_mask):
-        """Calcola tutte le componenti della loss."""
+    def _compute_losses_dict(self, x_start_gt: torch.Tensor, predicted_x0: torch.Tensor,
+                             t: torch.Tensor, y_cond: Dict[str, Any], bone_mask: torch.Tensor
+                             ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """ Computes the losses for the given ground truth and predicted tensors. """
         terms = {}
         current_total_loss = torch.tensor(0.0, device=self.device)
-        
-        temporal_mask = y_cond.get('mask') # [bs, 1, 1, nframes_gt], True per validi
+        temporal_mask = y_cond.get('mask') # Expected: [bs, 1, 1, nframes_gt], True for VALID
 
-        # Loss principale
         combined_mask_x0 = self._get_combined_mask(temporal_mask, bone_mask, x_start_gt.shape)
         timestep_weights = self._get_timestep_loss_weights(t)
         
         main_loss_val = self._calculate_masked_loss(
             predicted_x0, x_start_gt, combined_mask_x0, self.main_loss_type,
-            sample_timestep_weights=timestep_weights
-        )
-        terms[f"main_{self.main_loss_type}"] = main_loss_val.item()
+            sample_timestep_weights=timestep_weights )
+        terms[f"main_loss/{self.main_loss_type}"] = main_loss_val.item() # Changed for clarity
         current_total_loss += main_loss_val
         if timestep_weights is not None:
-            terms["avg_ts_w"] = timestep_weights.mean().item()
+            terms["debug/avg_timestep_weight"] = timestep_weights.mean().item()
 
-        # Loss ausiliarie
         pred_vel, pred_accel = self._get_derivatives(predicted_x0)
         target_vel, target_accel = self._get_derivatives(x_start_gt)
 
@@ -292,7 +419,7 @@ class ArmatureMDMTrainerRevised:
                 bone_mask_vel = bone_mask[:, :pred_vel.shape[1], :]
                 combined_mask_kin_vel = self._get_combined_mask(mask_vel_temp, bone_mask_vel, target_vel.shape)
                 loss_val = self._calculate_masked_loss(pred_vel, target_vel, combined_mask_kin_vel, self.kinematic_loss_type)
-                terms["kin_vel"] = loss_val.item()
+                terms["kinematic/velocity_loss"] = loss_val.item()
                 current_total_loss += self.lambda_kin_vel * loss_val
 
             if self.lambda_kin_accel > 0 and pred_accel.shape[1] > 0:
@@ -300,65 +427,71 @@ class ArmatureMDMTrainerRevised:
                 bone_mask_accel = bone_mask[:, :pred_accel.shape[1], :]
                 combined_mask_kin_accel = self._get_combined_mask(mask_accel_temp, bone_mask_accel, target_accel.shape)
                 loss_val = self._calculate_masked_loss(pred_accel, target_accel, combined_mask_kin_accel, self.kinematic_loss_type)
-                terms["kin_accel"] = loss_val.item()
+                terms["kinematic/acceleration_loss"] = loss_val.item()
                 current_total_loss += self.lambda_kin_accel * loss_val
         
         if self.use_mdm_geometric_losses:
-            if self.lambda_geom_pos > 0: # L_rcxyz in MDM
+            # (Ensure data is XYZ for these if that's what MDM original expects)
+            if self.lambda_geom_pos > 0:
                 loss_val = self._calculate_masked_loss(predicted_x0, x_start_gt, combined_mask_x0, "mse")
-                terms["geom_pos"] = loss_val.item()
+                terms["geometric/position_loss"] = loss_val.item()
                 current_total_loss += self.lambda_geom_pos * loss_val
             
-            if self.lambda_geom_vel > 0 and pred_vel.shape[1] > 0: # L_vel in MDM
+            if self.lambda_geom_vel > 0 and pred_vel.shape[1] > 0:
                 mask_vel_temp_geom = temporal_mask[..., :pred_vel.shape[1]] if temporal_mask is not None else None
                 bone_mask_vel_geom = bone_mask[:, :pred_vel.shape[1], :]
                 combined_mask_geom_vel = self._get_combined_mask(mask_vel_temp_geom, bone_mask_vel_geom, target_vel.shape)
                 loss_val = self._calculate_masked_loss(pred_vel, target_vel, combined_mask_geom_vel, "mse")
-                terms["geom_vel"] = loss_val.item()
+                terms["geometric/velocity_loss"] = loss_val.item()
                 current_total_loss += self.lambda_geom_vel * loss_val
 
-            if self.lambda_geom_foot > 0 and y_cond.get("foot_contact_ground_truth") is not None and pred_vel.shape[1] > 0 : # L_fc in MDM
-                # Implementazione L_foot (complessa, richiede mapping preciso features/piedi e bone_mask)
-                # Per ora, la omettiamo per brevità, ma la logica andrebbe qui,
-                # adattando dalla tua classe MDMGeometricLosses precedente.
-                # Si userebbero self.foot_joint_indices, self.num_joints_for_geom, self.features_per_joint_for_geom
-                # e si dovrebbe estrarre la porzione rilevante della bone_mask.
-                # terms["geom_foot"] = loss_foot_val.item()
+            if self.lambda_geom_foot > 0 and y_cond.get("foot_contact_ground_truth") is not None and pred_vel.shape[1] > 0 :
+                # ... (Foot contact loss logic, needs careful adaptation and bone_mask for foot features) ...
+                # Placeholder for L_foot implementation
+                # loss_foot_val = calculate_your_l_foot(...)
+                # terms["geometric/foot_contact_loss"] = loss_foot_val.item()
                 # current_total_loss += self.lambda_geom_foot * loss_foot_val
-                pass
-
-        terms["loss"] = current_total_loss.item() # Loss totale finale
-        return current_total_loss, terms
+                logger.debug("Foot contact loss calculation skipped (placeholder).")
 
 
-    def run_step(self, batch_data):
-        """ Corrisponde a TrainLoop.run_step """
+        terms["total_loss"] = current_total_loss.item() # Store the final combined loss value too
+        return current_total_loss, terms # Return the tensor for backward, and dict for logging
+
+
+    def run_step(self, batch_data: Dict[str, Any]) -> Dict[str, float]:
+        """
+        Performs a single training step (forward pass, loss calculation, backward pass, optimizer step).
+        Corresponds to MDM's TrainLoop.run_step.
+
+        :param Dict[str, Any] batch_data: The batch data from the DataLoader.
+        :return: Dict[str, float]: A dictionary of loss components for logging.
+        """
         self.model.train()
         self.opt.zero_grad()
 
-        x_start_gt = batch_data["target_x0"].to(self.device) # Ground truth motion
+        x_start_gt = batch_data["target_x0"].to(self.device)
         
         y_cond = {
             'text_embeddings_batch': batch_data["text_embeddings"].to(self.device),
             'armature_class_ids': batch_data["armature_class_ids"].to(self.device),
+            # Prepare motion_padding_mask for y_cond['mask']
+            # Expected: [bs, 1, 1, nframes], True for VALID
             'mask': batch_data.get('motion_padding_mask_for_loss').to(self.device) if batch_data.get('motion_padding_mask_for_loss') is not None else None,
             'foot_contact_ground_truth': batch_data.get("foot_contact_ground_truth").to(self.device) if batch_data.get("foot_contact_ground_truth") is not None else None,
-            'uncond': False, 'uncond_text': False, 'uncond_armature': False
+            'uncond': False, 'uncond_text': False, 'uncond_armature': False # Defaults for CFG
         }
-
-        t, _ = self.schedule_sampler.sample(x_start_gt.shape[0], self.device) # Campiona timesteps
         
-        # Applica CFG dropout flags in training
-        if self.cfg_drop_prob_trainer > 0:
+        # Apply CFG dropout based on training settings
+        if self.cfg_drop_prob_trainer > 0: # Check if CFG is active for training
             if torch.rand(1).item() < self.cfg_drop_prob_trainer:
-                y_cond['uncond'] = True # Usato da _mask_cond nel modello
-                # Potresti anche impostare y_cond['uncond_text'] e y_cond['uncond_armature'] = True
+                y_cond['uncond'] = True # Global uncond flag for _mask_cond in model
+                y_cond['uncond_text'] = True
+                y_cond['uncond_armature'] = True
 
+        t, _ = self.schedule_sampler.sample(x_start_gt.shape[0], self.device)
         noise = torch.randn_like(x_start_gt)
-        x_t = self.diffusion_util.q_sample(x_start_gt, t, noise=noise) # Crea input rumoroso
+        x_t = self.diffusion_util.q_sample(x_start_gt, t, noise=noise)
 
-        # Esegui il forward pass e calcola le loss
-        # Il modello ArmatureMDM ora si aspetta x_t, t, e y_cond
         predicted_x0 = self.model(x_t, t, y_cond)
 
         bs, nframes, nfeatures = x_start_gt.shape
@@ -367,145 +500,261 @@ class ArmatureMDMTrainerRevised:
             armature_config_data=self.armature_config_data
         )
         
-        # Calcola tutte le loss
-        total_loss_tensor, losses_dict_batch_float = self._compute_losses_dict(
+        total_loss_tensor, losses_dict_float = self._compute_losses_dict(
             x_start_gt, predicted_x0, t, y_cond, bone_mask
         )
         
         total_loss_tensor.backward()
         self.opt.step()
-        # self._anneal_lr() # Se implementato
         
-        return losses_dict_batch_float
+        return losses_dict_float
 
 
-    def run_loop(self): # Corrisponde a TrainLoop.run_loop
-        logger.info(f"Starting training for {self.num_epochs} epochs.")
-        
+    def run_loop(self):
+        """
+        Main training loop that iterates over epochs and batches.
+        Corresponds to MDM's TrainLoop.run_loop.
+        """
+        logger.info(f"Starting training for {self.num_epochs} epochs on device {self.device}.")
+        training_history = {'train_loss_total': [], 'val_loss_total': []} # Store total loss per epoch
+
         for epoch_idx in range(self.current_epoch, self.num_epochs):
             self.current_epoch = epoch_idx
             logger.info(f"--- Epoch {self.current_epoch + 1}/{self.num_epochs} ---")
             
-            epoch_loss_components_sum = {}
+            self.model.train() # Ensure model is in training mode for this epoch
+            epoch_loss_components_sum: Dict[str, float] = {}
             num_batches_in_epoch = len(self.data_loader)
 
-            # La barra tqdm per le epoche è gestita qui
-            # La barra tqdm per i batch è stata rimossa come da tua richiesta precedente
-            for batch_idx, batch_data in enumerate(self.data_loader):
+            if num_batches_in_epoch == 0:
+                logger.warning(f"Epoch {self.current_epoch + 1}: Training DataLoader is empty. Skipping epoch.")
+                continue
+
+            for batch_idx, batch_data in enumerate(tqdm(self.data_loader, desc=f"Training Epoch {self.current_epoch + 1}")):
+                if batch_data is None:
+                    logger.warning(f"Epoch {self.current_epoch + 1}, Batch {batch_idx}: Skipping None batch.")
+                    continue
+                
                 losses_batch = self.run_step(batch_data)
                 self.completed_steps += 1
 
                 for key, val in losses_batch.items():
                     epoch_loss_components_sum[key] = epoch_loss_components_sum.get(key, 0.0) + val
-                
-                # Log per step (MDM style, meno frequente del log per batch)
-                # if self.completed_steps % self.args.get('training_hyperparameters',{}).get('log_interval_mdm_style', 1000) == 0:
-                #     log_str_step = f"Step {self.completed_steps}: " + " | ".join([f"{k}: {v:.4f}" for k,v in losses_batch.items()])
-                #     logger.info(log_str_step)
             
-            # Log di fine epoca
-            avg_epoch_losses = {k: v / num_batches_in_epoch for k, v in epoch_loss_components_sum.items()}
-            log_train_summary = f"Epoch {self.current_epoch + 1} Training Summary: " + \
-                                ", ".join([f"Avg {k}: {v:.4f}" for k,v in avg_epoch_losses.items()])
-            logger.info(log_train_summary)
+            # Log average losses for the epoch
+            if num_batches_in_epoch > 0:
+                avg_epoch_losses = {k: v / num_batches_in_epoch for k, v in epoch_loss_components_sum.items()}
+                log_train_summary = f"Epoch {self.current_epoch + 1} Training Summary: " + \
+                                    ", ".join([f"Avg {k}: {v:.4f}" for k,v in avg_epoch_losses.items()])
+                logger.info(log_train_summary)
+                training_history['train_loss_total'].append(avg_epoch_losses.get("total_loss", float('nan')))
 
-            # Validazione a fine epoca
+
+            # Validation phase
+            avg_val_total_loss = float('inf')
             if self.val_data_loader is not None:
-                avg_val_loss = self.evaluate() # evaluate() gestirà il logging della validazione
+                avg_val_total_loss, _ = self.evaluate_epoch() # evaluate_epoch will log its details
+                training_history['val_loss_total'].append(avg_val_total_loss)
+
                 if self.lr_scheduler and isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                    self.lr_scheduler.step(avg_val_loss)
+                    self.lr_scheduler.step(avg_val_total_loss)
                 
-                if avg_val_loss < self._best_val_loss - self.early_stopping_min_delta:
-                    self._best_val_loss = avg_val_loss
+                if avg_val_total_loss < self._best_val_loss - self.early_stopping_min_delta:
+                    self._best_val_loss = avg_val_total_loss
                     self._early_stopping_counter = 0
-                    logger.info(f"New best validation loss: {self._best_val_loss:.4f}. Saving best model...")
-                    self.save_checkpoint("best")
+                    logger.info(f"New best validation loss: {self._best_val_loss:.4f}. Saving model...")
+                    self.save_checkpoint(suffix="best")
                 else:
                     self._early_stopping_counter += 1
-                    logger.info(f"Validation loss did not improve. Counter: {self._early_stopping_counter}/{self.early_stopping_patience}")
+                    logger.info(f"Validation loss did not improve significantly. Early stopping counter: {self._early_stopping_counter}/{self.early_stopping_patience}")
                     if self._early_stopping_counter >= self.early_stopping_patience:
                         logger.info(f"Early stopping triggered at epoch {self.current_epoch + 1}.")
-                        break
+                        break # Exit training loop
             
             if not isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau) and self.lr_scheduler is not None:
-                self.lr_scheduler.step()
+                self.lr_scheduler.step() # For schedulers like StepLR
 
-            # Salva checkpoint periodicamente (basato su epoche invece che step per semplicità qui)
-            if (self.current_epoch + 1) % self.args.get('training_hyperparameters',{}).get('save_interval_epochs', 10) == 0:
-                self.save_checkpoint(f"epoch_{self.current_epoch+1}")
+            # Periodic checkpoint saving (based on epochs)
+            save_interval = self.args.get('training_hyperparameters',{}).get('save_interval_epochs', 10)
+            if (self.current_epoch + 1) % save_interval == 0 or (self.current_epoch + 1) == self.num_epochs:
+                self.save_checkpoint(suffix=f"epoch_{self.current_epoch+1}")
             
-        self.save_checkpoint("final") # Salvataggio finale
+            # Optional: Generate and save a sample animation
+            if self.generate_sample_every_n_epochs > 0 and \
+               (self.current_epoch + 1) % self.generate_sample_every_n_epochs == 0:
+                self._run_sample_generation(epoch_num=self.current_epoch + 1)
+
+        self.save_checkpoint(suffix="final")
         logger.info(f"Training finished after {self.current_epoch + 1} epochs / {self.completed_steps} steps.")
+        return training_history
 
 
-    def evaluate(self): # Simile al tuo evaluate_epoch
+    def evaluate_epoch(self) -> Tuple[float, Dict[str, float]]:
+        """
+        Evaluates the model for one epoch on the validation set.
+
+        :return: Tuple[float, Dict[str, float]]: Average total validation loss and dictionary of averaged component losses.
+        """
         self.model.eval()
-        total_val_loss = 0.0
-        val_loss_components_sum = {}
-        
+        total_val_loss_sum = 0.0
+        val_loss_components_sum: Dict[str, float] = {}
+        num_val_batches = len(self.val_data_loader)
+
+        if num_val_batches == 0:
+            logger.warning("Validation DataLoader is empty. Skipping evaluation.")
+            return float('inf'), {}
+
         with torch.no_grad():
-            for batch_data in self.val_data_loader:
+            for batch_data in tqdm(self.val_data_loader, desc=f"Validating Epoch {self.current_epoch + 1}"):
+                if batch_data is None: 
+                    logger.warning(f"Epoch {self.current_epoch + 1} Validation: Skipping None batch.")
+                    num_val_batches = max(1, num_val_batches -1) # Adjust count if a batch is skipped
+                    continue
+
                 x_start_gt = batch_data["target_x0"].to(self.device)
                 y_cond = {
                     'text_embeddings_batch': batch_data["text_embeddings"].to(self.device),
                     'armature_class_ids': batch_data["armature_class_ids"].to(self.device),
                     'mask': batch_data.get('motion_padding_mask_for_loss').to(self.device) if batch_data.get('motion_padding_mask_for_loss') is not None else None,
                     'foot_contact_ground_truth': batch_data.get("foot_contact_ground_truth").to(self.device) if batch_data.get("foot_contact_ground_truth") is not None else None,
-                    'uncond': False, 'uncond_text': False, 'uncond_armature': False # No CFG dropout for validation loss
+                    'uncond': False, 'uncond_text': False, 'uncond_armature': False
                 }
                 t, _ = self.schedule_sampler.sample(x_start_gt.shape[0], self.device)
                 
-                # Forward pass per ottenere predicted_x0
                 predicted_x0 = self.model(self.diffusion_util.q_sample(x_start_gt, t, noise=torch.randn_like(x_start_gt)), t, y_cond)
 
                 bs, nframes, nfeatures = x_start_gt.shape
                 bone_mask = self.get_bone_mask_fn(
                     y_cond['armature_class_ids'], nfeatures, nframes, str(self.device),
-                    armature_config_data=self.armature_config_data
-                )
+                    armature_config_data=self.armature_config_data )
                 
-                # Calcola loss per questo batch di validazione
                 _, losses_dict_val_batch = self._compute_losses_dict(
-                    x_start_gt, predicted_x0, t, y_cond, bone_mask
-                )
+                    x_start_gt, predicted_x0, t, y_cond, bone_mask )
 
-                total_val_loss += losses_dict_val_batch["loss"] # "loss" è la loss totale combinata
+                total_val_loss_sum += losses_dict_val_batch.get("total_loss", 0.0)
                 for key, val in losses_dict_val_batch.items():
                     val_loss_components_sum[key] = val_loss_components_sum.get(key, 0.0) + val
         
-        avg_val_loss = total_val_loss / len(self.val_data_loader) if len(self.val_data_loader) > 0 else 0
+        avg_val_total_loss = total_val_loss_sum / num_val_batches if num_val_batches > 0 else float('inf')
+        avg_val_loss_components = {k: v / num_val_batches if num_val_batches > 0 else 0.0 for k, v in val_loss_components_sum.items()}
+        
         log_val_summary = f"Epoch {self.current_epoch + 1} Validation Summary: " + \
-                          ", ".join([f"Avg {k}: {v / len(self.val_data_loader) if len(self.val_data_loader) > 0 else 0:.4f}" for k,v in val_loss_components_sum.items()])
+                          ", ".join([f"Avg {k}: {v:.4f}" for k,v in avg_val_loss_components.items()])
         logger.info(log_val_summary)
         
-        self.model.train()
-        return avg_val_loss # Ritorna la loss totale media per early stopping / LR scheduler
+        return avg_val_total_loss, avg_val_loss_components
+
 
     def save_checkpoint(self, suffix: str):
+        """
+        Saves a model checkpoint.
+
+        :param str suffix: Suffix for the checkpoint filename (e.g., "best", "final", "epoch_100").
+        """
         filename = f"{self.model_filename_base}_{suffix}.pth"
-        save_path = os.path.join(self.model_save_dir, filename)
-        logger.info(f"Saving model checkpoint to {save_path} (Epoch: {self.current_epoch+1}, Step: {self.completed_steps})")
+        save_path = self.model_save_dir / filename # model_save_dir is now Path
         
+        logger.info(f"Saving model checkpoint to {save_path} (Epoch: {self.current_epoch+1}, Total Steps: {self.completed_steps})")
         state_to_save = {
             'epoch': self.current_epoch,
             'completed_steps': self.completed_steps,
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.opt.state_dict(),
-            'config': self.args, # Salva la configurazione usata
-            '_best_val_loss': self._best_val_loss, # Per resume
-            '_early_stopping_counter': self._early_stopping_counter # Per resume
+            'config': self.args,
+            '_best_val_loss': self._best_val_loss,
+            '_early_stopping_counter': self._early_stopping_counter
         }
         if self.lr_scheduler is not None:
             state_to_save['scheduler_state_dict'] = self.lr_scheduler.state_dict()
-        torch.save(state_to_save, save_path)
-        logger.info(f"Checkpoint saved: {save_path}")
+        try:
+            torch.save(state_to_save, str(save_path)) # torch.save needs string path
+            logger.info(f"Checkpoint saved successfully: {save_path}")
+        except Exception as e:
+            logger.error(f"Error saving checkpoint {save_path}: {e}")
 
-    # _anneal_lr e altri metodi helper da MDM TrainLoop possono essere aggiunti qui se necessario
-    # Esempio:
-    # def _anneal_lr(self):
-    #     if not self.lr_anneal_steps:
-    #         return
-    #     frac_done = self.completed_steps / self.lr_anneal_steps
-    #     lr = self.lr * (1 - frac_done)
-    #     for param_group in self.opt.param_groups:
-    #         param_group["lr"] = lr
+    @torch.no_grad()
+    def _run_sample_generation(self, epoch_num: int):
+        """Generates and saves a sample animation during training."""
+        if not (self.generate_sample_every_n_epochs > 0 and hasattr(self, 'sbert_processor_for_sampling')):
+            return
+
+        logger.info(f"Generating inspection sample for epoch {epoch_num}...")
+        current_model_training_state = self.model.training
+        self.model.eval()
+
+        # Use diffusion.py utilities for generation
+        diffusion_sampler_cfg = self.args.get('diffusion_hyperparameters', {})
+        betas_np = get_named_beta_schedule(
+            schedule_name=diffusion_sampler_cfg.get('noise_schedule_mdm', 'linear'),
+            num_diffusion_timesteps=diffusion_sampler_cfg.get('num_diffusion_timesteps', 1000) )
+        
+        sampler_util = GaussianDiffusionSamplerUtil(
+            betas=betas_np,
+            model_mean_type=diffusion_sampler_cfg.get('model_mean_type_mdm', 'START_X'),
+            model_var_type=diffusion_sampler_cfg.get('model_var_type_mdm', 'FIXED_SMALL'),
+            loss_type="MSE", # Assuming MSE is the default loss type
+        )
+        
+        try:
+            text_emb = self.sbert_processor_for_sampling.encode(
+                self.sample_generation_prompt, convert_to_tensor=True).unsqueeze(0).to(self.device)
+        except Exception as e:
+            logger.error(f"Error encoding sample text with SBERT: {e}. Skipping sample generation.")
+            self.model.train(current_model_training_state)
+            return
+
+        y_conditions = {
+            'text_embeddings_batch': text_emb,
+            'armature_class_ids': torch.tensor([self.sample_generation_armature_id], dtype=torch.long).to(self.device),
+            'mask': None, # No padding mask for a single generated sample
+            'cfg_scale': self.sample_generation_cfg_scale
+        }
+
+        generated_motion_tensor = generate_motion_mdm_style(
+            armature_mdm_model=self.model,
+            diffusion_sampler_util=sampler_util,
+            y_conditions=y_conditions,
+            num_frames=self.sample_generation_num_frames,
+            device=str(self.device),
+            clip_denoised=True,
+            progress=False # Typically no progress bar for internal sampling
+        )
+
+        if generated_motion_tensor is not None:
+            # Save and animate
+            motion_np = generated_motion_tensor.squeeze(0).cpu().numpy()
+            
+            # De-normalize (Requires dataset_mean and dataset_std to be accessible, e.g., via self.data_loader.dataset)
+            if hasattr(self.data_loader.dataset, 'dataset_mean') and hasattr(self.data_loader.dataset, 'dataset_std'):
+                mean_for_denorm = self.data_loader.dataset.dataset_mean
+                std_for_denorm = np.where(self.data_loader.dataset.dataset_std == 0, 1e-8, self.data_loader.dataset.dataset_std)
+                motion_np = motion_np * std_for_denorm + mean_for_denorm
+            else:
+                logger.warning("Mean/std for de-normalization not found in dataset. Animating normalized data.")
+
+            model_hyperparams = self.args.get('model_hyperparameters', {})
+            num_j_viz = model_hyperparams.get('num_joints_for_geom', self.model.njoints)
+            feat_p_j_viz = model_hyperparams.get('features_per_joint_for_geom', self.model.nfeats)
+
+            animation_filename = f"{self.args.get('run_name', 'run')}_epoch{epoch_num}_arm{self.sample_generation_armature_id}.gif"
+            animation_output_path = self.sample_generation_output_dir / animation_filename
+            
+            if motion_np.shape[1] == num_j_viz * feat_p_j_viz:
+                motion_reshaped = motion_np.reshape(self.sample_generation_num_frames, num_j_viz, feat_p_j_viz)
+                # motion_centered = motion_reshaped - motion_reshaped[:, 0:1, :] # Optional centering
+                try:
+                    create_motion_animation(
+                        motion_data_frames=motion_reshaped, # or motion_centered
+                        kinematic_chain=T2M_KINEMATIC_CHAIN, # Make sure this is defined/imported
+                        output_filename=str(animation_output_path),
+                        fps=30 # Or from config
+                    )
+                    logger.info(f"Saved sample animation to {animation_output_path}")
+                except Exception as e:
+                    logger.error(f"Failed to create sample animation for epoch {epoch_num}: {e}")
+            else:
+                 logger.warning(f"Sample shape mismatch for animation: got {motion_np.shape[1]} features, expected {num_j_viz*feat_p_j_viz}.")
+
+
+        self.model.train(current_model_training_state) # Restore model training state
+        logger.info(f"Inspection sample generation attempt complete for epoch {epoch_num}.")

@@ -1,86 +1,136 @@
-run_name: "diffusion_experiment_01"
+run_name: "ArmatureMDM_Run_01"
 
 paths:
-  data_root_dir: "C:/PythonProjects/text2motion/data/"
-  armature_config_file: "config/armature_config.json" # Relative to project root
-  annotations_file_name: "annotations_train.csv" # Relative to data_root_dir
-  val_annotations_file_name: "annotations_val.csv" # Relative to data_root_dir
-  motion_subdir: "new_joints" # Subdirectory within data_root_dir
-  model_save_dir: "C:/PythonProjects/text2motion/trained_models_final" # Absolute path for saving models
-  model_filename: "armature_mdm_final.pth"
-  precomputed_sbert_train_path: "./data/sbert_embeddings_train.pt" # Relative to project root or ensure full path
-  precomputed_sbert_val_path: "./data/sbert_embeddings_val.pt"   # Relative to project root or ensure full path
+  data_root_dir: "C:/PythonProjects/text2motion/data/" # Path to the root of your dataset
+  armature_config_file: "config/armature_config.json" # Relative to the project root
+  annotations_file_name: "annotations_train.csv"    # Relative to data_root_dir
+  val_annotations_file_name: "annotations_val.csv"  # Relative to data_root_dir
+  motion_subdir: "new_joints" # Subdirectory containing .npy motion files inside data_root_dir
+
+  # Paths to precomputed SBERT embeddings
+  precomputed_sbert_train_path: "./data/sbert_embeddings_train.pt"
+  precomputed_sbert_val_path: "./data/sbert_embeddings_val.pt"
+
+  # Training output
+  model_save_dir: "C:/PythonProjects/text2motion/experiments_output/" # Where to save models and logs
+  model_filename: "armature_mdm_checkpoint.pth" # Base name for checkpoints saved by the trainer
 
 diffusion_hyperparameters:
-  num_diffusion_timesteps: 1000 # SUGGESTION: Increased from 100. Monitor training time.
-                               # MDM paper uses 1000.
+  num_diffusion_timesteps: 1000 # Number of diffusion steps (MDM uses 1000)
+  noise_schedule_mdm: "cosine"  # Beta schedule ('linear' or 'cosine', as in MDM)
+  beta_start: 0.0001            # Starting beta value for linear schedule
+  beta_end: 0.02                # Ending beta value for linear schedule
+  # Parameters for GaussianDiffusionSamplerUtil (used during generation)
+  model_mean_type_mdm: "START_X"  # Our ArmatureMDM predicts x0 (MDM: ModelMeanType.START_X)
+  model_var_type_mdm: "FIXED_SMALL" # Variance for sampling (MDM: ModelVarType.FIXED_SMALL or FIXED_LARGE)
 
 model_hyperparameters:
-  num_motion_features: 66
-  latent_dim: 768
-  ff_size: 1024
-  num_layers: 8
-  num_heads: 4
-  dropout: 0.1
-  sbert_model_name: 'all-mpnet-base-v2'
-  sbert_embedding_dim: 768
+  # Data representation definitions (CRUCIAL for ArmatureMDM)
+  data_rep: "xyz"        # Options: 'xyz', 'rot6d_flat', 'xyz_structured', 'rot6d_structured'
+                         # '_flat' means num_motion_features is the total vector size per frame.
+                         # '_structured' means input to ArmatureMDM forward is [bs, njoints, nfeats, nframes]
+                         # and input_feats is computed as njoints * nfeats_per_joint.
+                         # For your case with .npy containing 3 values (XYZ) flattened per frame, use 'xyz_flat'.
+  njoints: 22                 # Number of joints (e.g., 22 for HumanML3D-like data)
+  nfeats_per_joint: 3         # Features per joint (3 for XYZ, 6 for rot6d)
+  num_motion_features_actual: 66 # (njoints * nfeats_per_joint) If data_rep='xyz_flat', this is input_feats.
+                                 # Ignored if data_rep='xyz_structured' (will be computed internally).
+
+  # Architecture (aligned with MDM and your ArmatureMDM)
+  latent_dim: 256             # Your latent dimension
+  ff_size: 1024               # FeedForward size in the Transformer
+  num_layers: 8               # Number of layers in TransformerEncoder
+  num_heads: 4                # Number of attention heads
+  dropout: 0.1                # General dropout
+  activation: "gelu"          # Activation function (MDM uses gelu)
+  arch: "trans_enc"           # Architecture (MDM: 'trans_enc', 'trans_dec', 'gru')
+                             # Our ArmatureMDM is based on 'trans_enc'
+  batch_first_transformer: False # Default False to match MDM (Transformer expects [seq_len, bs, dim])
+                                # If True, the Transformer expects [bs, seq_len, dim]
+
+  # Text conditioning (SBERT)
+  sbert_model_name: 'all-mpnet-base-v2' # SBERT model name (for logging or use in dataset)
+  sbert_embedding_dim: 768              # SBERT output dimension (input to self.embed_text)
+  clip_dim: 768                         # For naming consistency with MDM, equals sbert_embedding_dim
+
+  # Armature conditioning (yours)
   max_armature_classes: 10
   armature_embedding_dim: 64
-  text_time_cond_policy: "add"
-  armature_integration_policy: "add" # Current setting. Test "add" if "concat" seems problematic.
-  timestep_embedder_type: "mlp"
-  text_cond_dropout_prob: 0.1
-  armature_cond_dropout_prob: 0.1 # SUGGESTION: Was 0.2. If issues with armature conditioning, try 0.1 or 0.15.
-  max_seq_len_pos_enc: 5000
-  use_final_algebraic_refinement_encoder: true
-  algebraic_refinement_hidden_dim: null
-  timestep_gru_num_layers: 1
-  timestep_gru_dropout: 0.0
-  num_joints_for_geom: 22
+  armature_mlp_hidden_dims: [256, 512] # List of hidden dimensions for the armature MLP, e.g., [256, 512]
+                                       # If empty or null, defaults to a single nn.Linear to latent_dim.
+
+  # General model parameters
+  max_seq_len_pos_enc: 5000              # For PositionalEncoding
+  cond_mask_prob: 0.1                    # Probability of masking text embedding (MDM-style)
+  armature_cond_mask_prob: 0.1           # Probability of masking armature embedding
+
+  # Parameters for geometric/kinematic losses (e.g., SMPL joints)
+  num_joints_for_geom: 22                # Number of joints for L_foot, etc.
   features_per_joint_for_geom: 3
 
 training_hyperparameters:
-  batch_size: 32 # SUGGESTION: Was 128. Reduced for potentially more stable gradients & less memory. Adjust based on GPU.
-  num_epochs: 50 # Or more, if static output persists and loss is still decreasing.
-  learning_rate: 0.0005 # SUGGESTION: Slightly reduced from 0.001, especially if enabling LR scheduler or if loss is unstable.
-  cfg_drop_prob_trainer: 0.15 # SUGGESTION: Was 0.2. Slight reduction to balance conditional/unconditional.
+  batch_size: 32
+  num_epochs: 1
+  learning_rate: 0.0001
+  weight_decay: 0.0
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  
+  cfg_drop_prob_trainer: 0.15           # Probability of using CFG mask during training (in the Trainer)
   device: "cuda"
-  use_lr_scheduler: true # SUGGESTION: Enabled.
+  
+  use_lr_scheduler: true
   lr_scheduler_factor: 0.5
-  main_loss_type_trainer: "mse"
+  # lr_anneal_steps_mdm_style: 0 # If 0, LR is constant or managed by ReduceLROnPlateau. If >0, MDM uses linear annealing.
 
+  # Logging and saving in the Trainer (based on epochs, can be adjusted to steps if preferred)
+  log_interval_epochs: 1               # Log averages every N epochs
+  save_interval_epochs: 25             # Save checkpoint every N epochs
+  
+  # Sample generation during training
+  generate_sample_every_n_epochs: 10
+  sample_generation_prompt: "a person is jumping excitedly"
+  sample_generation_armature_id: 1
+  sample_generation_num_frames: 120     # Length of generated sample
+  sample_generation_cfg_scale: 2.5      # CFG scale used in sample generation
+  sample_generation_const_noise: False  # Whether to use constant noise for samples
 
-  generate_sample_every_n_epochs: 2  # Generate a sample every 5 epochs. Set to 0 to disable.
-  sample_generation_prompt: "a person is jumping excitedly" # Text prompt for the sample
-  sample_generation_armature_id: 1    # Armature ID for the sample
-  sample_generation_num_frames: 1000   # Number of frames for the sample animation
-  sample_generation_cfg_scale: 2.5
-
-main_x0_loss_config:
+main_x0_loss_config: # Configuration for the main x0 reconstruction loss
   timestep_weighting:
-    scheme: "snr_plus_one" # Keep this for now, as it's a good scheme to try.
-    min_snr_gamma_value: 5.0
+    scheme: "snr_plus_one" # Options: "none", "snr_plus_one", "min_snr_gamma" (MDM doesn't use min_snr_gamma by default)
+    min_snr_gamma_value: 5.0 # Used only if scheme is "min_snr_gamma"
 
 early_stopping:
-  early_stopping_patience: 10
+  early_stopping_patience: 20 # Slightly increased due to longer training
   early_stopping_min_delta: 0.0001
       
-kinematic_losses:
-  use_kinematic_losses: true # Keep false initially. Enable if motion lacks smoothness after other changes.
-  velocity_loss_weight: 0.05   # Reduced example weight if activated
-  acceleration_loss_weight: 0.05 # Reduced example weight if activated
-  kinematic_loss_type: "l1"
+# Auxiliary loss weights (conceptually aligned with MDM lambdas)
+# The main loss implicitly has weight 1.0
+kinematic_losses: # Your kinematic losses (L1 or MSE on velocity/acceleration of x0)
+  use_kinematic_losses: true
+  velocity_loss_weight: 0.5      
+  acceleration_loss_weight: 0.2
+  kinematic_loss_type: "l1"      # Loss type (l1 or mse)
 
-mdm_geometric_losses:
+mdm_geometric_losses: # Geometric losses inspired by MDM (always MSE)
   use_mdm_geometric_losses: true
-  lambda_pos: 0.05  # SUGGESTION: Slightly reduced from 0.1, to give velocity more relative importance.
-  lambda_vel: 0.1  # SUGGESTION: Drastically reduced from 0.5. If this is too low and motion is wild, increase.
-                     # The goal is to see if reducing its penalty allows dynamics to emerge.
-  lambda_foot: 0.0  # Keep at 0.0 if foot_contact_gt is not available or reliable.
-                     # If available, try 0.5 or 1.0.
-  foot_joint_indices: [10, 11]
+  lambda_pos: 0.0                # MDM's L_rcxyz, often 0 if main loss is already on XYZ.
+                                # If your main_loss is on rotations, consider setting > 0 for XYZ supervision.
+  lambda_vel: 0.7                # MDM's L_vel (on velocity of rotations or XYZ). RECOMMENDATION: Increased (e.g., 0.1 → 1.0)
+  lambda_foot: 0.5               # MDM's L_fc (foot contact). RECOMMENDED if you have foot_contact_gt. Requires implementation.
+  foot_joint_indices: [10, 11]   # Example indices for left foot, right foot (based on HumanML3D)
 
 dataset_parameters:
-  min_seq_len_dataset: 20 # SUGGESTION: Increased from 5. Very short sequences might not capture enough dynamics.
-  max_seq_len_dataset: 120 # SUGGESTION: Increased from 100 slightly, if memory allows, for more context.
-  dataset_device: 'cpu'
+  min_seq_len_dataset: 20
+  max_seq_len_dataset: 120 # Max sequence length from dataset for training.
+                           # Longer sequences will be truncated/segmented.
+                           # Shorter ones may be discarded or padded.
+  num_dataloader_workers: 0 # Number of workers for DataLoader
+  dataset_name_for_mdm: "custom_armature" # Dataset name used in MDM info logs (e.g., 'humanml', 'kit')
+  # text_only_eval: False # Whether evaluation loader should load only text (for certain MDM metrics)
+
+# Generation/sampling-specific parameters (used by generate_motion_mdm_style)
+generation_params:
+  cfg_scale: 2.5
+  render_fps: 20 # FPS for generated GIF animations
+  # const_noise_generation: False # Whether to use constant noise for final generation (distinct from sample_generation_const_noise)
