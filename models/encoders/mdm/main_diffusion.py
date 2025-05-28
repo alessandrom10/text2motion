@@ -16,7 +16,7 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 from ArmatureMDM import ArmatureMDM
-from TrainerMDM import ArmatureMDMTrainer, KinematicLossCalculator, MDMGeometricLosses
+from TrainerMDM import ArmatureMDMTrainer, KinematicLoss, MDMGeometricLoss
 
 from dataset.motion_dataset_loader import (
     MyTextToMotionDataset, 
@@ -323,7 +323,7 @@ def run_training_pipeline(config: Dict[str, Any]) -> None:
     if kinematic_params.get('use_kinematic_losses', False):
         if kinematic_params.get('velocity_loss_weight', 0.0) > 0 or \
            kinematic_params.get('acceleration_loss_weight', 0.0) > 0:
-            kinematic_calculator = KinematicLossCalculator(
+            kinematic_calculator = KinematicLoss(
                 get_bone_mask_fn=get_bone_mask_for_armature,
                 device=str(device), 
                 use_velocity_loss=(kinematic_params.get('velocity_loss_weight', 0.0) > 0),
@@ -338,7 +338,7 @@ def run_training_pipeline(config: Dict[str, Any]) -> None:
     mdm_geom_cfg = config.get('mdm_geometric_losses', {})
     if mdm_geom_cfg.get('use_mdm_geometric_losses', False):
         logger.info("Initializing MDMGeometricLosses calculator...")
-        mdm_geom_loss_calc = MDMGeometricLosses(
+        mdm_geom_loss_calc = MDMGeometricLoss(
             lambda_pos=mdm_geom_cfg.get('lambda_pos', 0.0),
             lambda_vel=mdm_geom_cfg.get('lambda_vel', 0.0), # Set to 0 if you only want L_foot
             lambda_foot=mdm_geom_cfg.get('lambda_foot', 0.0), # Set >0 to activate

@@ -14,7 +14,7 @@ from utils.diffusion_utils import T2M_KINEMATIC_CHAIN, create_motion_animation
 logger = logging.getLogger(__name__)
 
 
-class MDMGeometricLosses(nn.Module):
+class MDMGeometricLoss(nn.Module):
     """
     Calculates geometric losses as described in the MDM paper:
     L_pos (if applicable, assuming x0 is already positions), L_vel, and L_foot.
@@ -234,7 +234,7 @@ class MDMGeometricLosses(nn.Module):
         return total_geometric_loss, losses
 
 
-class KinematicLossCalculator:
+class KinematicLoss:
     """
     Class to compute kinematic losses (velocity, acceleration) on the predicted x0 from the ArmatureMDM model.
     This aligns with the MDM paper's approach of applying geometric losses to the predicted sample.
@@ -1058,7 +1058,7 @@ class ArmatureMDMTrainer:
                     tqdm_postfix_short = {"status": "NaN_loss"}
                     batch_iterator.set_postfix(loss="NaN", **tqdm_postfix_short)
                     '''
-                    logger.warning(f"NaN loss detected during validation at batch {batch_idx} in epoch {epoch_num}.")
+                    #logger.warning(f"NaN loss detected during validation at batch {batch_idx} in epoch {epoch_num}.")
                     continue
                     
                 '''
