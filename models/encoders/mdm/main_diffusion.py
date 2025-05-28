@@ -28,7 +28,7 @@ from utils.diffusion_utils import (
     load_armature_config,
     setup_logging,
     get_noise_schedule,
-    plot_training_history,
+    plot_detailed_training_history,
     get_bone_mask_for_armature,
     generate_and_save_sbert_embeddings
 )

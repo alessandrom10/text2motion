@@ -37,7 +37,7 @@ model_hyperparameters:
                                  # Ignored if data_rep='xyz_structured' (will be computed internally).
 
   # Architecture (aligned with MDM and your ArmatureMDM)
-  latent_dim: 256             # Your latent dimension
+  latent_dim: 512             # Your latent dimension
   ff_size: 1024               # FeedForward size in the Transformer
   num_layers: 8               # Number of layers in TransformerEncoder
   num_heads: 4                # Number of attention heads
@@ -128,6 +128,11 @@ dataset_parameters:
   num_dataloader_workers: 0 # Number of workers for DataLoader
   dataset_name_for_mdm: "custom_armature" # Dataset name used in MDM info logs (e.g., 'humanml', 'kit')
   # text_only_eval: False # Whether evaluation loader should load only text (for certain MDM metrics)
+  subset_size: null
+  shuffle_subset_after_sampling: true
+
+  val_subset_size: null
+  val_shuffle_subset_after_sampling: true
 
 # Generation/sampling-specific parameters (used by generate_motion_mdm_style)
 generation_params:

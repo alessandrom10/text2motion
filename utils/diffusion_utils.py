@@ -1,6 +1,8 @@
 import json
 import logging
 import os
+from pathlib import Path
+import re
 from typing import Dict, List, Optional
 
 from matplotlib.animation import FuncAnimation, PillowWriter
@@ -79,64 +81,107 @@ def get_noise_schedule(num_diffusion_timesteps: int,
     return alphas_cumprod
 
 
-def plot_training_history(history: Dict[str, List[float]],
-                            main_val_metric_name: str,
-                            model_save_dir: str,
-                            run_name: str) -> None:
-    """
-    Plots training & validation total loss, and a specified main validation metric.
+def sanitize_filename(name: str) -> str:
+    """ Sanitizes a string to be a valid filename. """
+    name = name.lower()
+    name = re.sub(r'[^\w\s-]', '', name) # Remove non-alphanumeric, non-whitespace, non-hyphen
+    name = re.sub(r'[-\s]+', '_', name)  # Replace hyphens and spaces with underscores
+    return name[:50] # Truncate to a reasonable length
 
-    :param history: Dictionary containing 'train_loss', 'val_loss', 'val_metric' lists.
-    :param main_val_metric_name: Name of the main validation metric for plotting title and label.
-    :param model_save_dir: Directory to save the plot.
-    :param run_name: Name of the current run, used for the plot filename.
+def plot_detailed_training_history(
+    training_history: Dict[str, List[float]],
+    model_save_dir: Path,
+    run_name: str,
+    current_epoch_completed: int
+) -> None:
     """
-    train_losses_epochs = history.get('train_loss', [])
-    val_losses_epochs = history.get('val_loss', [])
-    val_main_metric_epochs = history.get('val_metric', [])
+    Plots training & validation losses for each component and saves them as images.
 
-    if not train_losses_epochs:
-        logger.warning("No training loss data provided to plot.")
+    :param training_history: Dictionary where keys are loss names
+                             (e.g., 'train_main_loss/mse', 'val_kinematic/velocity_loss')
+                             and values are lists of loss values per epoch.
+    :param model_save_dir: Path object to the base directory to save the plots.
+    :param run_name: Name of the current run, used for plot filenames.
+    :param current_epoch_completed: The current epoch number (1-based) that has just finished.
+    """
+    if not training_history:
+        logger.warning("Plotting: Training history is empty. No plots will be generated.")
         return
 
-    num_train_epochs_completed = len(train_losses_epochs)
-    epochs_axis_train = range(1, num_train_epochs_completed + 1)
+    plot_output_dir = model_save_dir / "loss_plots"
+    plot_output_dir.mkdir(parents=True, exist_ok=True)
 
-    plt.figure(figsize=(14, 6))
+    processed_basenames = set()
 
-    plt.subplot(1, 2, 1)
-    plt.plot(epochs_axis_train, train_losses_epochs, 'bo-', label='Training Loss (Avg Total)')
-    if val_losses_epochs:
-        epochs_axis_val_loss = range(1, len(val_losses_epochs) + 1)
-        plt.plot(epochs_axis_val_loss, val_losses_epochs, 'ro-', label='Validation Loss (Avg Total)')
-    plt.title('Training & Validation Total Loss')
-    plt.xlabel('Epochs')
-    plt.ylabel('Loss')
-    plt.legend()
-    plt.grid(True)
+    for key in list(training_history.keys()):
+        is_train_key = key.startswith('train_')
+        is_val_key = key.startswith('val_')
 
-    # Plot 2: Main Validation Metric
-    if val_main_metric_epochs:
-        epochs_axis_val_metric = range(1, len(val_main_metric_epochs) + 1)
-        plt.subplot(1, 2, 2)
-        plt.plot(epochs_axis_val_metric, val_main_metric_epochs, 'go-', label=f'Validation {main_val_metric_name}')
-        plt.title(f'Validation {main_val_metric_name}')
+        if is_train_key:
+            basename = key.replace('train_', '', 1)
+        elif is_val_key:
+            basename = key.replace('val_', '', 1)
+        else:
+            basename = key 
+        
+        if basename in processed_basenames and (is_train_key or is_val_key):
+            continue
+        
+        plt.figure(figsize=(10, 6))
+        legend_items = []
+        
+        epochs_plotted = 0
+
+        if f'train_{basename}' in training_history:
+            train_losses = training_history[f'train_{basename}']
+            if train_losses:
+                epochs_axis_train = range(1, len(train_losses) + 1)
+                plt.plot(epochs_axis_train, train_losses, 'bo-', label=f'Training {basename}')
+                legend_items.append(f'Training {basename}')
+                epochs_plotted = max(epochs_plotted, len(train_losses))
+            processed_basenames.add(basename) # Mark as processed
+
+        if f'val_{basename}' in training_history:
+            val_losses = training_history[f'val_{basename}']
+            if val_losses:
+                epochs_axis_val = range(1, len(val_losses) + 1)
+                plt.plot(epochs_axis_val, val_losses, 'ro-', label=f'Validation {basename}')
+                legend_items.append(f'Validation {basename}')
+                epochs_plotted = max(epochs_plotted, len(val_losses))
+            processed_basenames.add(basename) # Mark as processed
+        
+        if not legend_items:
+            if basename in training_history and training_history[basename]:
+                losses_generic = training_history[basename]
+                epochs_axis_generic = range(1, len(losses_generic) +1)
+                plt.plot(epochs_axis_generic, losses_generic, 'go-', label=basename)
+                legend_items.append(basename)
+                epochs_plotted = max(epochs_plotted, len(losses_generic))
+            else:
+                plt.close()
+                continue
+
+        sanitized_basename = sanitize_filename(basename)
+        plt.title(f'{sanitized_basename} - Up to Epoch {current_epoch_completed}')
         plt.xlabel('Epochs')
-        plt.ylabel(main_val_metric_name)
-        plt.legend()
+        plt.ylabel('Loss Value')
+        if legend_items: # Add legend only if there are items to show
+            plt.legend()
         plt.grid(True)
-    else:
-        logger.info("No main validation metric data provided for plotting.")
+        plt.tight_layout()
 
+        plot_filename = f"{sanitize_filename(run_name)}_epoch_{current_epoch_completed}_{sanitized_basename}.png"
+        plot_save_path = plot_output_dir / plot_filename
 
-    plt.tight_layout()
-    plot_save_path = os.path.join(model_save_dir, f"training_plots_{run_name}.png")
-    try:
-        plt.savefig(plot_save_path)
-        logger.info(f"Training plots saved to {plot_save_path}")
-    except Exception as e:
-        logger.error(f"Failed to save plots: {e}", exc_info=True)
-    # plt.show() # Typically commented out for non-interactive server runs
+        try:
+            plt.savefig(str(plot_save_path))
+        except Exception as e:
+            logger.error(f"Failed to save plot {plot_save_path}: {e}")
+        finally:
+            plt.close()
+            
+    if epochs_plotted > 0 : # If we plotted at least one graph
+        logger.info(f"Individual loss plots saved to {plot_output_dir} for epoch {current_epoch_completed}.")
 
 
 def get_bone_mask_for_armature(armature_class_ids: torch.Tensor,
