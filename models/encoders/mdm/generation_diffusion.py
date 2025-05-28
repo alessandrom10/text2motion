@@ -178,7 +178,7 @@ if __name__ == '__main__':
     
     try:
         logger.info(f"Loading trained model from: {model_checkpoint_path}")
-        checkpoint = torch.load(str(model_checkpoint_path), map_location=device, weights_only=False) # Set weights_only=True for safety if from untrusted source
+        checkpoint = torch.load(str(model_checkpoint_path), map_location=device, weights_only=True) # Set weights_only=True for safety if from untrusted source
         if 'model_state_dict' in checkpoint:
             loaded_model.load_state_dict(checkpoint['model_state_dict'])
         else:

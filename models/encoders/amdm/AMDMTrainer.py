@@ -18,7 +18,7 @@ from AMDM import ArmatureMDM
 from sentence_transformers import SentenceTransformer
 
 from diffusion import generate_motion_mdm_style, GaussianDiffusionSamplerUtil
-from utils.diffusion_utils import create_motion_animation, T2M_KINEMATIC_CHAIN
+from utils.diffusion_utils import create_motion_animation, T2M_KINEMATIC_CHAIN, plot_detailed_training_history, sanitize_filename
 
 
 logger = logging.getLogger(__name__)
@@ -195,6 +195,8 @@ class ADMTrainer:
         train_cfg = self.args.get('training_hyperparameters', {})
         paths_cfg = self.args.get('paths', {})
         model_cfg = self.args.get('model_hyperparameters', {})
+
+        self.training_history: Dict[str, List[float]] = {} 
 
         self.device = torch.device(train_cfg.get('device', 'cuda' if torch.cuda.is_available() else 'cpu'))
         self.model.to(self.device)
@@ -612,14 +614,30 @@ class ADMTrainer:
                                     ", ".join([f"Avg {k}: {v:.4f}" for k,v in avg_epoch_losses.items()])
                 logger.info(log_train_summary)
                 training_history['train_loss_total'].append(avg_epoch_losses.get("total_loss", float('nan')))
+                
+                # Store each loss component in training history
+                for loss_name, avg_value in avg_epoch_losses.items():
+                    history_key_train = f'train_{sanitize_filename(loss_name)}'
+                    if history_key_train not in self.training_history:
+                        self.training_history[history_key_train] = []
+                    self.training_history[history_key_train].append(avg_value)
 
 
             # Validation phase
             avg_val_total_loss = float('inf')
             if self.val_data_loader is not None:
-                avg_val_total_loss, _ = self.evaluate_epoch() # evaluate_epoch will log its details
+                avg_val_total_loss, avg_val_loss_components_epoch = self.evaluate_epoch() # evaluate_epoch will log its details
                 training_history['val_loss_total'].append(avg_val_total_loss)
 
+                # Store validation losses in training history
+                if avg_val_loss_components_epoch: 
+                    for loss_name, avg_value in avg_val_loss_components_epoch.items():
+                        history_key_val = f'val_{sanitize_filename(loss_name)}'
+                        if history_key_val not in self.training_history:
+                            self.training_history[history_key_val] = []
+                        self.training_history[history_key_val].append(avg_value)
+
+                # Reduce LR if using ReduceLROnPlateau scheduler
                 if self.lr_scheduler and isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
                     self.lr_scheduler.step(avg_val_total_loss)
                 
@@ -647,6 +665,14 @@ class ADMTrainer:
             if self.generate_sample_every_n_epochs > 0 and \
                (self.current_epoch + 1) % self.generate_sample_every_n_epochs == 0:
                 self._run_sample_generation(epoch_num=self.current_epoch + 1)
+
+            # Final save plot of training history
+            plot_detailed_training_history(
+                self.training_history,
+                self.model_save_dir,
+                self.args.get('run_name', 'run'),
+                self.current_epoch + 1
+            )
 
         self.save_checkpoint(suffix="final")
         logger.info(f"Training finished after {self.current_epoch + 1} epochs / {self.completed_steps} steps.")
@@ -801,7 +827,10 @@ class ADMTrainer:
             num_j_viz = model_hyperparams.get('num_joints_for_geom', self.model.njoints)
             feat_p_j_viz = model_hyperparams.get('features_per_joint_for_geom', self.model.nfeats)
 
-            animation_filename = f"{self.args.get('run_name', 'run')}_epoch{epoch_num}_arm{self.sample_generation_armature_id}.gif"
+            # Text and animation filename
+            sanitized_prompt = sanitize_filename(self.sample_generation_prompt)
+            sanitized_prompt = sanitized_prompt[:50].replace(" ", "_")  # Limit length and replace spaces
+            animation_filename = f"epoch{epoch_num}_arm{self.sample_generation_armature_id}_{sanitized_prompt}.gif"
             animation_output_path = self.sample_generation_output_dir / animation_filename
             
             if motion_np.shape[1] == num_j_viz * feat_p_j_viz:

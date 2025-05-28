@@ -163,6 +163,12 @@ def main_training_and_generation_loop(config_path: Path, generation_text: str, g
         logger.error("num_motion_features (or njoints/nfeats_per_joint) not specified in model_hyperparameters.")
         return
 
+    train_subset_size = dataset_cfg.get('subset_size', None)
+    if train_subset_size is not None and train_subset_size <= 0:
+        train_subset_size = None
+    
+    train_shuffle_subset = dataset_cfg.get('shuffle_subset_after_sampling', True)
+
     train_dataset = MyTextToMotionDataset(
         root_dir=str(data_root_abs),
         annotations_file_name=paths_cfg.get('annotations_file_name'),
@@ -175,16 +181,24 @@ def main_training_and_generation_loop(config_path: Path, generation_text: str, g
         dataset_std_path=dataset_std_path_str,
         min_seq_len=dataset_cfg.get('min_seq_len_dataset'),
         max_seq_len=dataset_cfg.get('max_seq_len_dataset'),
+        subset_size=train_subset_size,
+        shuffle_subset=train_shuffle_subset,
         data_device=dataset_cfg.get('dataset_device', 'cpu')
     )
     train_loader = DataLoader(
         train_dataset, batch_size=train_cfg.get('batch_size'), shuffle=True,
         num_workers=train_cfg.get('num_dataloader_workers', 0), collate_fn=collate_motion_data_revised
     )
-    logger.info(f"Training dataset loaded: {len(train_dataset)} samples.")
+    logger.info(f"Training data loaded: {len(train_dataset)} samples (subset_size: {train_subset_size}, shuffle_subset: {train_shuffle_subset}).")
 
     val_loader = None
     if paths_cfg.get('val_annotations_file_name'):
+        val_subset_size = dataset_cfg.get('val_subset_size', None)
+        if val_subset_size is not None and val_subset_size <= 0:
+            val_subset_size = None
+        
+        val_shuffle_subset = dataset_cfg.get('val_shuffle_subset_after_sampling', True)
+
         val_dataset = MyTextToMotionDataset(
             root_dir=str(data_root_abs),
             annotations_file_name=paths_cfg.get('val_annotations_file_name'),
@@ -197,13 +211,15 @@ def main_training_and_generation_loop(config_path: Path, generation_text: str, g
             dataset_std_path=dataset_std_path_str,
             min_seq_len=dataset_cfg.get('min_seq_len_dataset'),
             max_seq_len=dataset_cfg.get('max_seq_len_dataset'),
+            subset_size=val_subset_size,
+            shuffle_subset=val_shuffle_subset,
             data_device=dataset_cfg.get('dataset_device', 'cpu')
         )
         val_loader = DataLoader(
             val_dataset, batch_size=train_cfg.get('batch_size'), shuffle=False,
             num_workers=train_cfg.get('num_dataloader_workers', 0), collate_fn=collate_motion_data_revised
         )
-        logger.info(f"Validation dataset loaded: {len(val_dataset)} samples.")
+        logger.info(f"Validation data loaded: {len(val_dataset)} samples (subset_size: {val_subset_size}, shuffle_subset: {val_shuffle_subset}).")
 
     logger.info("Initializing ArmatureMDM model...")
     armature_mdm_model = ArmatureMDM(
@@ -237,7 +253,7 @@ def main_training_and_generation_loop(config_path: Path, generation_text: str, g
         lr_scheduler_instance = optim.lr_scheduler.ReduceLROnPlateau(
             temp_optimizer_for_scheduler, 'min',
             factor=train_cfg.get('lr_scheduler_factor', 0.5),
-            patience=config.get('early_stopping', {}).get('early_stopping_patience', 10) // 2,
+            patience=config.get('early_stopping', {}).get('early_stopping_patience', 50) // 2,
             verbose=True )
 
     trainer = ADMTrainer(
@@ -276,7 +292,7 @@ def main_training_and_generation_loop(config_path: Path, generation_text: str, g
         return
 
     logger.info(f"Loading model for generation from: {model_load_path}")
-    checkpoint = torch.load(str(model_load_path), map_location=device)
+    checkpoint = torch.load(str(model_load_path), map_location=device, weights_only=True)
     loaded_config_from_ckpt = checkpoint.get('config', config)
     model_cfg_loaded = loaded_config_from_ckpt.get('model_hyperparameters', model_cfg)
 
@@ -343,7 +359,7 @@ def main_training_and_generation_loop(config_path: Path, generation_text: str, g
 
     gen_output_dir = model_save_dir / "generated_samples"
     gen_output_dir.mkdir(exist_ok=True)
-    animation_filename = f"gen_arm{generation_armature_id}_cfg{y_conditions_for_generation['cfg_scale']}_{run_name}.gif"
+    animation_filename = f"gen_arm{generation_armature_id}_cfg{y_conditions_for_generation['cfg_scale']}_{run_name}_while_{generation_text[:50].replace(' ', '_')}.gif"
     animation_output_path = gen_output_dir / animation_filename
 
     motion_np = generated_motion.squeeze(0).cpu().numpy()

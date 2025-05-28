@@ -6,6 +6,7 @@ applies normalization, and prepares batches for training the ArmatureMDM.
 import logging
 import os
 from pathlib import Path
+import random
 from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
@@ -134,6 +135,8 @@ class MyTextToMotionDataset(Dataset):
                  dataset_std_path: str,
                  min_seq_len: int = 10,
                  max_seq_len: Optional[int] = 120,
+                 subset_size: Optional[int] = None,
+                 shuffle_subset: bool = True,
                  timestep_sampler_fn: Callable = default_uniform_timestep_sampler,
                  noise_fn: Callable = default_gaussian_noise_fn,
                  noising_fn: Callable = default_ddpm_noising_fn,
@@ -155,6 +158,8 @@ class MyTextToMotionDataset(Dataset):
         :param Optional[int] max_seq_len: Maximum sequence length. Longer sequences are truncated.
                                           If None, no truncation by max_seq_len is performed in __getitem__,
                                           relying on collate_fn for batch-level padding.
+        :param Optional[int] subset_size: If provided, limits the dataset to this many samples.
+        :param bool shuffle_subset: If True, shuffles the dataset after loading a subset.
         :param Callable timestep_sampler_fn: Function to sample a timestep t.
         :param Callable noise_fn: Function to generate noise epsilon.
         :param Callable noising_fn: Function to apply noise (x0, eps, t, alphas_cumprod) -> xt.
@@ -175,10 +180,12 @@ class MyTextToMotionDataset(Dataset):
         self.timestep_sampler = timestep_sampler_fn
         self.noise_generator = noise_fn
         self.apply_noise = noising_fn
+
+        self.shuffle_subset = shuffle_subset
         
         try:
             logger.info(f"Loading precomputed SBERT embeddings from: {precomputed_sbert_embeddings_path}")
-            self.sbert_embeddings_cache = torch.load(precomputed_sbert_embeddings_path, map_location=self.data_device)
+            self.sbert_embeddings_cache = torch.load(precomputed_sbert_embeddings_path, map_location=self.data_device, weights_only=True)
             logger.info(f"Loaded {len(self.sbert_embeddings_cache)} SBERT embeddings.")
         except Exception as e:
             logger.error(f"Error loading SBERT embeddings from {precomputed_sbert_embeddings_path}: {e}", exc_info=True)
@@ -196,17 +203,23 @@ class MyTextToMotionDataset(Dataset):
             logger.error(f"Error loading dataset mean/std from {dataset_mean_path}/{dataset_std_path}: {e}", exc_info=True)
             raise
             
-        self._prepare_samples()
+        self._prepare_samples(subset_size)
 
-    def _prepare_samples(self):
-        """Loads and filters samples from the annotations file."""
+    def _prepare_samples(self, subset_size: Optional[int] = None):
+        """
+        Loads and filters samples from the annotations file.
+        Filters out samples with missing motion files, text prompts, or armature IDs.
+        If subset_size is provided, limits the dataset to this many samples.
+        :param Optional[int] subset_size: If provided, limits the dataset to this many samples.
+        """
         self.samples: List[Dict[str, Any]] = []
         try:
             annotations_df = pd.read_csv(self.annotations_path)
         except Exception as e:
             logger.error(f"Error reading annotations file {self.annotations_path}: {e}", exc_info=True)
             raise
-
+        
+        all_valid_samples_intermediate: List[Dict[str, Any]] = []
         for idx, row in annotations_df.iterrows():
             motion_filename = row.get('motion_filename')
             text_prompt = str(row.get('text', ''))
@@ -224,20 +237,36 @@ class MyTextToMotionDataset(Dataset):
                 logger.warning(f"Precomputed SBERT embedding not found for text: '{text_prompt[:50]}...' (row {idx}). Skipping sample.")
                 continue
             
-            # Optionally, pre-check motion length here if feasible, or rely on __getitem__
-            # For example, by loading a small part of the .npy or storing lengths in annotations.
-            # This can speed up _prepare_samples if many files are too short.
-
-            self.samples.append({
+            all_valid_samples_intermediate.append({
                 'motion_file_path': str(file_path),
                 'text_prompt': text_prompt,
                 'armature_id': armature_id
             })
-        
+
+            if not all_valid_samples_intermediate:
+                raise ValueError(f"No valid samples found after initial filtering. Check annotations, paths, SBERT cache.")
+
+        # Apply subset sampling if subset_size is provided and valid
+        if subset_size is not None and subset_size > 0 and subset_size < len(all_valid_samples_intermediate):
+            logger.info(f"Sampling a subset of {subset_size} from {len(all_valid_samples_intermediate)} valid samples.")
+            # Shuffle before sampling for a random subset, or sample directly if order doesn't matter before the optional shuffle
+            random.shuffle(all_valid_samples_intermediate) # Shuffle all valid ones first
+            self.samples = all_valid_samples_intermediate[:subset_size]
+        else:
+            self.samples = all_valid_samples_intermediate
+
+        # Shuffle the final list of samples if shuffle_subset is True
+        if self.shuffle_subset: # This flag is now self.shuffle_subset, set in __init__
+            logger.info(f"Shuffling the final list of {len(self.samples)} samples.")
+            random.shuffle(self.samples)
+        else:
+            logger.info(f"Skipping shuffle for the final list of {len(self.samples)} samples as per configuration.")
+
         if not self.samples:
-            raise ValueError(f"No valid samples loaded. Check annotations file '{self.annotations_path}', "
+            raise ValueError(f"No samples available after processing and subsetting. Subset size was {subset_size}. Check annotations file '{self.annotations_path}', "
                              f"motion directory '{self.motion_dir_abs}', and SBERT cache.")
-        logger.info(f"Prepared {len(self.samples)} valid samples from annotations.")
+        logger.info(f"Prepared {len(self.samples)} samples for the dataset (subset_size: {subset_size}, shuffle_subset: {self.shuffle_subset}).")
+        
 
     def __len__(self) -> int:
         """Returns the total number of samples in the dataset."""

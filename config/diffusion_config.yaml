@@ -37,7 +37,7 @@ model_hyperparameters:
                                  # Ignored if data_rep='xyz_structured' (will be computed internally).
 
   # Architecture (aligned with MDM and your ArmatureMDM)
-  latent_dim: 512             # Your latent dimension
+  latent_dim: 256             # Your latent dimension
   ff_size: 1024               # FeedForward size in the Transformer
   num_layers: 8               # Number of layers in TransformerEncoder
   num_heads: 4                # Number of attention heads
@@ -121,8 +121,8 @@ mdm_geometric_losses: # Geometric losses inspired by MDM (always MSE)
   foot_joint_indices: [10, 11]   # Example indices for left foot, right foot (based on HumanML3D)
 
 dataset_parameters:
-  min_seq_len_dataset: 20
-  max_seq_len_dataset: 120 # Max sequence length from dataset for training.
+  min_seq_len_dataset: 50
+  max_seq_len_dataset: 300 # Max sequence length from dataset for training.
                            # Longer sequences will be truncated/segmented.
                            # Shorter ones may be discarded or padded.
   num_dataloader_workers: 0 # Number of workers for DataLoader
