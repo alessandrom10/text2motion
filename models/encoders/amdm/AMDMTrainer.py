@@ -827,8 +827,9 @@ class ADMTrainer:
                 logger.warning("Mean/std for de-normalization not found in dataset. Animating normalized data.")
 
             model_hyperparams = self.args.get('model_hyperparameters', {})
-            num_j_viz = model_hyperparams.get('num_joints_for_geom', self.model.njoints)
-            feat_p_j_viz = model_hyperparams.get('features_per_joint_for_geom', self.model.nfeats)
+            model_to_inspect = self.model.module if isinstance(self.model, torch.nn.DataParallel) else self.model
+            num_j_viz = model_hyperparams.get('num_joints_for_geom', model_to_inspect.njoints)
+            feat_p_j_viz = model_hyperparams.get('features_per_joint_for_geom', model_to_inspect.nfeats)
 
             # Text and animation filename
             sanitized_prompt = sanitize_filename(self.sample_generation_prompt)
