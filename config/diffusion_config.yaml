@@ -56,7 +56,7 @@ model_hyperparameters:
   # Armature conditioning (yours)
   max_armature_classes: 10
   armature_embedding_dim: 64
-  armature_mlp_hidden_dims: [512, 256] # MLP hidden dimensions for armature embedding
+  armature_mlp_hidden_dims: [256, 512] # MLP hidden dimensions for armature embedding
 
   # General model parameters
   max_seq_len_pos_enc: 5000              # For PositionalEncoding
