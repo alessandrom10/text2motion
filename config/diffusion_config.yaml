@@ -37,11 +37,11 @@ model_hyperparameters:
                                  # Ignored if data_rep='xyz_structured' (will be computed internally).
 
   # Architecture (aligned with MDM and your ArmatureMDM)
-  latent_dim: 256             # Your latent dimension
+  latent_dim: 512             # Your latent dimension
   ff_size: 1024               # FeedForward size in the Transformer
-  num_layers: 8               # Number of layers in TransformerEncoder
-  num_heads: 4                # Number of attention heads
-  dropout: 0.15                # General dropout
+  num_layers: 10               # Number of layers in TransformerEncoder
+  num_heads: 6                # Number of attention heads
+  dropout: 0.05                # General dropout
   activation: "gelu"          # Activation function (MDM uses gelu)
   arch: "trans_enc"           # Architecture (MDM: 'trans_enc', 'trans_dec', 'gru')
                              # Our ArmatureMDM is based on 'trans_enc'
@@ -56,8 +56,7 @@ model_hyperparameters:
   # Armature conditioning (yours)
   max_armature_classes: 10
   armature_embedding_dim: 64
-  armature_mlp_hidden_dims: [256, 512] # List of hidden dimensions for the armature MLP, e.g., [256, 512]
-                                       # If empty or null, defaults to a single nn.Linear to latent_dim.
+  armature_mlp_hidden_dims: [512, 256] # MLP hidden dimensions for armature embedding
 
   # General model parameters
   max_seq_len_pos_enc: 5000              # For PositionalEncoding
@@ -76,7 +75,7 @@ training_hyperparameters:
   adam_beta1: 0.9
   adam_beta2: 0.999
   
-  cfg_drop_prob_trainer: 0.15           # Probability of using CFG mask during training (in the Trainer)
+  cfg_drop_prob_trainer: 0.10           # Probability of using CFG mask during training (in the Trainer)
   device: "cuda"
   
   use_lr_scheduler: true
