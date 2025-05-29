@@ -745,10 +745,13 @@ class ADMTrainer:
         save_path = self.model_save_dir / filename # model_save_dir is now Path
         
         logger.info(f"Saving model checkpoint to {save_path} (Epoch: {self.current_epoch+1}, Total Steps: {self.completed_steps})")
+
+        model_state_dict_to_save = self.model.module.state_dict() if isinstance(self.model, torch.nn.DataParallel) else self.model.state_dict()
+
         state_to_save = {
             'epoch': self.current_epoch,
             'completed_steps': self.completed_steps,
-            'model_state_dict': self.model.state_dict(),
+            'model_state_dict': model_state_dict_to_save,
             'optimizer_state_dict': self.opt.state_dict(),
             'config': self.args,
             '_best_val_loss': self._best_val_loss,

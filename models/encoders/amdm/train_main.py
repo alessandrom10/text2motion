@@ -222,7 +222,7 @@ def main_training_and_generation_loop(config_path: Path, generation_text: str, g
         logger.info(f"Validation data loaded: {len(val_dataset)} samples (subset_size: {val_subset_size}, shuffle_subset: {val_shuffle_subset}).")
 
     logger.info("Initializing ArmatureMDM model...")
-    armature_mdm_model = ArmatureMDM(
+    armature_mdm_model_base = ArmatureMDM(
         data_rep=model_cfg.get('data_rep'),
         njoints=model_cfg.get('njoints'),
         nfeats_per_joint=model_cfg.get('nfeats_per_joint'),
@@ -242,7 +242,17 @@ def main_training_and_generation_loop(config_path: Path, generation_text: str, g
         armature_cond_mask_prob=model_cfg.get('armature_cond_mask_prob', 0.1),
         arch=model_cfg.get('arch', 'trans_enc'),
         batch_first_transformer=model_cfg.get('batch_first_transformer', False)
-    ).to(device)
+    )
+
+    armature_mdm_model = armature_mdm_model_base.to(device)
+    is_data_parallel = False
+
+    if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+        logger.info(f"Using {torch.cuda.device_count()} GPUs with DataParallel.")
+        armature_mdm_model = torch.nn.DataParallel(armature_mdm_model_base) # DataParallel will distribute the model across available GPUs
+        armature_mdm_model.to(device) # move the model to the device after wrapping in DataParallel
+        is_data_parallel = True
+
     logger.info(f"ArmatureMDM model created. Parameters: {sum(p.numel() for p in armature_mdm_model.parameters() if p.requires_grad):,}")
 
     diffusion_util_trainer = GaussianDiffusionTrainerUtil(betas=betas_for_dataset_np)
@@ -261,16 +271,23 @@ def main_training_and_generation_loop(config_path: Path, generation_text: str, g
         train_loader=train_loader, get_bone_mask_fn=get_bone_mask_for_armature,
         model_save_dir=model_save_dir,
         armature_config_data=loaded_armature_config, val_loader=val_loader,
-        lr_scheduler=lr_scheduler_instance )
+        lr_scheduler=lr_scheduler_instance)
+
+
+    if is_data_parallel:
+        params_to_adam = armature_mdm_model.module.parameters()
+    else:
+        params_to_adam = armature_mdm_model.parameters()
 
     if lr_scheduler_instance and isinstance(lr_scheduler_instance, torch.optim.lr_scheduler.ReduceLROnPlateau):
-         trainer.opt = temp_optimizer_for_scheduler
+        trainer.opt = temp_optimizer_for_scheduler
     else:
-        trainer.opt = optim.AdamW(armature_mdm_model.parameters(), lr=train_cfg.get('learning_rate'),
-                                   weight_decay=train_cfg.get('weight_decay',0.0),
-                                   betas=(train_cfg.get('adam_beta1', 0.9), train_cfg.get('adam_beta2', 0.999)))
+        trainer.opt = optim.AdamW(params_to_adam, lr=train_cfg.get('learning_rate'),
+                                    weight_decay=train_cfg.get('weight_decay',0.0),
+                                    betas=(train_cfg.get('adam_beta1', 0.9), train_cfg.get('adam_beta2', 0.999))
+                                )
         if lr_scheduler_instance:
-             lr_scheduler_instance.optimizer = trainer.opt
+            lr_scheduler_instance.optimizer = trainer.opt
 
 
     logger.info("Starting training...")
