@@ -236,24 +236,35 @@ class ADMTrainer:
         # Log key parameters
 
     def _initialize_loss_weighting(self):
-        """Initializes parameters for timestep loss weighting."""
+        """Initializes parameters for timestep loss weighting, using the configured noise schedule."""
         main_x0_loss_cfg = self.args.get('main_x0_loss_config', {})
-        self.loss_weighting_scheme = main_x0_loss_cfg.get('timestep_weighting', {}).get('scheme', 'none')
-        self.min_snr_gamma_value = main_x0_loss_cfg.get('min_snr_gamma_value', 5.0)
+        weighting_cfg = main_x0_loss_cfg.get('timestep_weighting', {})
+        self.loss_weighting_scheme = weighting_cfg.get('scheme', 'none')
+        self.min_snr_gamma_value = weighting_cfg.get('min_snr_gamma_value', 5.0)
 
         if self.loss_weighting_scheme != "none":
-            diff_hyperparams = self.args.get('diffusion_hyperparameters', {})
-            beta_start = diff_hyperparams.get('beta_start', 0.0001)
-            beta_end = diff_hyperparams.get('beta_end', 0.02)
-            num_timesteps = diff_hyperparams.get('num_diffusion_timesteps', 1000)
+            diffusion_hyperparams = self.args.get('diffusion_hyperparameters', {})
             
-            betas = torch.linspace(beta_start, beta_end, num_timesteps, dtype=torch.float32, device=self.device)
-            alphas = 1.0 - betas
+            noise_schedule_name = diffusion_hyperparams.get('noise_schedule_mdm', 'cosine')
+            num_timesteps = diffusion_hyperparams.get('num_diffusion_timesteps', 1000)
+            
+            betas_np = get_named_beta_schedule( 
+                schedule_name=noise_schedule_name,
+                num_diffusion_timesteps=num_timesteps,
+            )
+            betas_torch = torch.from_numpy(betas_np).float().to(self.device)
+            
+            alphas = 1.0 - betas_torch
             self.alphas_cumprod_for_loss_weighting = torch.cumprod(alphas, axis=0)
+            
             if self.loss_weighting_scheme in ["snr_plus_one", "min_snr_gamma"]:
-                self.snr_for_loss_weighting = self.alphas_cumprod_for_loss_weighting / \
-                                             (1.0 - self.alphas_cumprod_for_loss_weighting + 1e-8)
-        logger.info(f"Main loss: {self.main_loss_type}, Timestep weighting: {self.loss_weighting_scheme}")
+                if hasattr(self, 'alphas_cumprod_for_loss_weighting'): 
+                    self.snr_for_loss_weighting = self.alphas_cumprod_for_loss_weighting / \
+                                                 (1.0 - self.alphas_cumprod_for_loss_weighting + 1e-8)
+                else: 
+                    logger.warning("alphas_cumprod_for_loss_weighting not initialized for SNR calc. Disabling weighting.")
+                    self.loss_weighting_scheme = "none" 
+        logger.info(f"Main loss type (trainer): {self.main_loss_type}, Timestep weighting: {self.loss_weighting_scheme}")
 
 
     def _initialize_aux_loss_params(self):
