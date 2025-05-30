@@ -195,6 +195,7 @@ class ADMTrainer:
         train_cfg = self.args.get('training_hyperparameters', {})
         paths_cfg = self.args.get('paths', {})
         model_cfg = self.args.get('model_hyperparameters', {})
+        diffusion_cfg = self.args.get('diffusion_hyperparameters', {})
 
         self.training_history: Dict[str, List[float]] = {} 
 
@@ -229,7 +230,7 @@ class ADMTrainer:
         self._initialize_loss_weighting()
         self._initialize_aux_loss_params()
         self._initialize_early_stopping()
-        self._initialize_sample_generation_params(train_cfg, model_cfg)
+        self._initialize_sample_generation_params(train_cfg, model_cfg, diffusion_cfg)
 
         logger.info("ArmatureMDMTrainerRevised initialized.")
         # Log key parameters
@@ -283,15 +284,24 @@ class ADMTrainer:
         self.early_stopping_min_delta = early_stop_cfg.get('early_stopping_min_delta', 0.0001)
         self._early_stopping_counter = 0
         self._best_val_loss = float('inf')
+        logger.info(f"Early stopping: Patience={self.early_stopping_patience}, Min delta={self.early_stopping_min_delta}")
 
-    def _initialize_sample_generation_params(self, train_cfg, model_cfg):
+    def _initialize_sample_generation_params(self, train_cfg, model_cfg, diffusion_cfg):
         """Initializes parameters for sample generation during training."""
         self.generate_sample_every_n_epochs = train_cfg.get('generate_sample_every_n_epochs', 0)
+
+        self.sample_generation_use_best_model = train_cfg.get('sample_generation_use_best_model', False)
+
+        self.sbert_processor_for_sampling = None
+        self.diffusion_sampler_for_sampling = None
+
         if self.generate_sample_every_n_epochs > 0:
             self.sample_generation_prompt = train_cfg.get('sample_generation_prompt', "a person walks")
             self.sample_generation_armature_id = train_cfg.get('sample_generation_armature_id', 1)
             self.sample_generation_num_frames = train_cfg.get('sample_generation_num_frames', 100)
             self.sample_generation_cfg_scale = train_cfg.get('sample_generation_cfg_scale', 2.5)
+            self.sample_generation_const_noise = train_cfg.get('sample_generation_const_noise', False)
+            self.sample_render_fps = self.args.get('generation_params',{}).get('render_fps', 30)
             
             # Output directory for samples is within the run's model_save_dir
             self.sample_generation_output_dir = self.model_save_dir / "training_samples"
@@ -308,7 +318,26 @@ class ADMTrainer:
             else:
                 logger.warning("SBERT model name not in config for sample generation. Disabling it.")
                 self.generate_sample_every_n_epochs = 0
-        logger.info(f"Sample generation during training: {'ENABLED every ' + str(self.generate_sample_every_n_epochs) + ' epochs' if self.generate_sample_every_n_epochs > 0 else 'DISABLED'}.")
+
+
+            if self.generate_sample_every_n_epochs > 0:
+                betas_np_sample_gen = get_named_beta_schedule(
+                    schedule_name=diffusion_cfg.get('noise_schedule_mdm', 'linear'),
+                    num_diffusion_timesteps=diffusion_cfg.get('num_diffusion_timesteps', 1000)
+                )
+                self.diffusion_sampler_for_sampling = GaussianDiffusionSamplerUtil(
+                    betas=betas_np_sample_gen,
+                    model_mean_type=diffusion_cfg.get('model_mean_type_mdm', 'START_X'),
+                    model_var_type=diffusion_cfg.get('model_var_type_mdm', 'FIXED_SMALL')
+                )
+                status_msg = f"ENABLED every {self.generate_sample_every_n_epochs} epochs"
+
+        if self.generate_sample_every_n_epochs > 0:
+            status_msg += f" (using {'BEST' if self.sample_generation_use_best_model else 'CURRENT'} model)"
+        else:
+            status_msg = "DISABLED"
+        logger.info(f"Sample generation during training: {status_msg}.")
+
 
     def _get_timestep_loss_weights(self, timesteps: torch.Tensor) -> torch.Tensor:
         """ Returns the loss weights for each timestep based on the configured scheme. """
@@ -768,91 +797,155 @@ class ADMTrainer:
     @torch.no_grad()
     def _run_sample_generation(self, epoch_num: int):
         """Generates and saves a sample animation during training."""
-        if not (self.generate_sample_every_n_epochs > 0 and hasattr(self, 'sbert_processor_for_sampling')):
+        if not (self.generate_sample_every_n_epochs > 0 and \
+                self.sbert_processor_for_sampling is not None and \
+                self.diffusion_sampler_for_sampling is not None):
+            if self.generate_sample_every_n_epochs > 0:
+                logger.warning("Sample generation skipped due to missing SBERT processor or diffusion sampler for sampling.")
             return
 
-        logger.info(f"Generating inspection sample for epoch {epoch_num} for text '{self.sample_generation_prompt}' and armature ID {self.sample_generation_armature_id}...")
+        logger.info(f"Generating inspection sample for epoch {epoch_num} for text '{self.sample_generation_prompt}' "
+                    f"and armature ID {self.sample_generation_armature_id} "
+                    f"(using {'BEST' if self.sample_generation_use_best_model else 'CURRENT'} model)...")
                     
-        current_model_training_state = self.model.training
-        self.model.eval()
+        model_to_use_for_sampling: ArmatureMDM
+        checkpoint_to_load_path: Optional[Path] = None
 
-        # Use diffusion.py utilities for generation
-        diffusion_sampler_cfg = self.args.get('diffusion_hyperparameters', {})
-        betas_np = get_named_beta_schedule(
-            schedule_name=diffusion_sampler_cfg.get('noise_schedule_mdm', 'linear'),
-            num_diffusion_timesteps=diffusion_sampler_cfg.get('num_diffusion_timesteps', 1000) )
-        
-        sampler_util = GaussianDiffusionSamplerUtil(
-            betas=betas_np,
-            model_mean_type=diffusion_sampler_cfg.get('model_mean_type_mdm', 'START_X'),
-            model_var_type=diffusion_sampler_cfg.get('model_var_type_mdm', 'FIXED_SMALL'),
-            #loss_type="MSE", # Assuming MSE is the default loss type
-        )
-        
+        if self.sample_generation_use_best_model and self.best_model_save_path.exists():
+            checkpoint_to_load_path = self.best_model_save_path
+            logger.info(f"Loading BEST model state from: {checkpoint_to_load_path}")
+        else:
+            if self.sample_generation_use_best_model and not self.best_model_save_path.exists():
+                logger.warning(f"BEST model for sampling requested, but {self.best_model_save_path} not found. "
+                               "Falling back to CURRENT model state.")
+            # Use the current model state for sampling
+            model_to_use_for_sampling = self.model.module if isinstance(self.model, torch.nn.DataParallel) else self.model
+
+
+        if checkpoint_to_load_path:
+            try:
+                # Load the checkpoint with weights_only=True to avoid loading optimizer state
+                checkpoint = torch.load(str(checkpoint_to_load_path), map_location=self.device, weights_only=True)
+                
+                config_from_ckpt = checkpoint.get('config', self.args)
+                model_cfg_sample = config_from_ckpt.get('model_hyperparameters', {})
+                
+                if "flat" in model_cfg_sample.get('data_rep', ""):
+                    sample_num_motion_features = model_cfg_sample.get('num_motion_features_actual')
+                else: 
+                    sample_num_motion_features = model_cfg_sample.get('njoints') * model_cfg_sample.get('nfeats_per_joint')
+
+                # Initialize the model with the loaded configuration
+                model_to_use_for_sampling = ArmatureMDM(
+                    data_rep=model_cfg_sample.get('data_rep'),
+                    njoints=model_cfg_sample.get('njoints'),
+                    nfeats_per_joint=model_cfg_sample.get('nfeats_per_joint'),
+                    num_motion_features=sample_num_motion_features,
+                    latent_dim=model_cfg_sample.get('latent_dim'),
+                    ff_size=model_cfg_sample.get('ff_size'),
+                    num_layers=model_cfg_sample.get('num_layers'),
+                    num_heads=model_cfg_sample.get('num_heads'),
+                    dropout=model_cfg_sample.get('dropout'),
+                    activation=model_cfg_sample.get('activation', 'gelu'),
+                    arch=model_cfg_sample.get('arch', 'trans_enc'),
+                    conditioning_integration_mode=model_cfg_sample.get('conditioning_integration_mode', "mlp"),
+                    conditioning_transformer_config=model_cfg_sample.get('conditioning_transformer_config', None),
+                    armature_integration_policy=model_cfg_sample.get('armature_integration_policy', "add_refined"),
+                    sbert_embedding_dim=model_cfg_sample.get('sbert_embedding_dim'),
+                    max_armature_classes=model_cfg_sample.get('max_armature_classes'),
+                    armature_embedding_dim=model_cfg_sample.get('armature_embedding_dim'),
+                    armature_mlp_hidden_dims=model_cfg_sample.get('armature_mlp_hidden_dims'),
+                    max_seq_len_pos_enc=model_cfg_sample.get('max_seq_len_pos_enc'),
+                    text_cond_mask_prob=model_cfg_sample.get('text_cond_mask_prob', 0.1),
+                    armature_cond_mask_prob=model_cfg_sample.get('armature_cond_mask_prob', 0.1),
+                    batch_first_transformer=model_cfg_sample.get('batch_first_transformer', False),
+                ).to(self.device)
+
+                model_to_use_for_sampling.load_state_dict(checkpoint['model_state_dict'])
+
+                logger.info(f"Successfully loaded BEST model state for sample generation.")
+            except Exception as e:
+                logger.error(f"Failed to load BEST model state from {checkpoint_to_load_path}: {e}. "
+                               "Falling back to CURRENT model state for sample generation.")
+                model_to_use_for_sampling = self.model.module if isinstance(self.model, torch.nn.DataParallel) else self.model
+
+        current_model_training_state = model_to_use_for_sampling.training
+        model_to_use_for_sampling.eval()
+
         try:
             text_emb = self.sbert_processor_for_sampling.encode(
                 self.sample_generation_prompt, convert_to_tensor=True).unsqueeze(0).to(self.device)
         except Exception as e:
-            logger.error(f"Error encoding sample text with SBERT: {e}. Skipping sample generation.")
-            self.model.train(current_model_training_state)
+            logger.error(f"Error encoding sample text with SBERT: {e}. Skipping sample generation this epoch.")
+            model_to_use_for_sampling.train(current_model_training_state)
             return
 
-        y_conditions = {
+        y_conditions_sample = {
             'text_embeddings_batch': text_emb,
             'armature_class_ids': torch.tensor([self.sample_generation_armature_id], dtype=torch.long).to(self.device),
-            'mask': None, # No padding mask for a single generated sample
-            'cfg_scale': self.sample_generation_cfg_scale
+            'mask': None, 
+            'cfg_scale': self.sample_generation_cfg_scale,
+            'uncond': False, 'uncond_text': False, 'uncond_armature': False
         }
 
-        generated_motion_tensor = generate_motion_mdm_style(
-            armature_mdm_model=self.model,
-            diffusion_sampler_util=sampler_util,
-            y_conditions=y_conditions,
-            num_frames=self.sample_generation_num_frames,
-            device=str(self.device),
-            clip_denoised=True,
-            progress=False # Typically no progress bar for internal sampling
-        )
+        try:
+            generated_motion_tensor = generate_motion_mdm_style(
+                armature_mdm_model=model_to_use_for_sampling,
+                diffusion_sampler_util=self.diffusion_sampler_for_sampling,
+                y_conditions=y_conditions_sample,
+                num_frames=self.sample_generation_num_frames,
+                device=str(self.device),
+                clip_denoised=True,
+                progress=False,
+                const_noise=self.sample_generation_const_noise
+            )
+        except Exception as e:
+            logger.error(f"Error during generate_motion_mdm_style for sample: {e}", exc_info=True)
+            model_to_use_for_sampling.train(current_model_training_state)
+            return
 
         if generated_motion_tensor is not None:
-            # Save and animate
             motion_np = generated_motion_tensor.squeeze(0).cpu().numpy()
             
-            # De-normalize (Requires dataset_mean and dataset_std to be accessible, e.g., via self.data_loader.dataset)
             if hasattr(self.data_loader.dataset, 'dataset_mean') and hasattr(self.data_loader.dataset, 'dataset_std'):
                 mean_for_denorm = self.data_loader.dataset.dataset_mean
                 std_for_denorm = np.where(self.data_loader.dataset.dataset_std == 0, 1e-8, self.data_loader.dataset.dataset_std)
-                motion_np = motion_np * std_for_denorm + mean_for_denorm
+                motion_np_denormalized = motion_np * std_for_denorm + mean_for_denorm
             else:
-                logger.warning("Mean/std for de-normalization not found in dataset. Animating normalized data.")
+                logger.warning("Mean/std for de-normalization not found in dataset for sample. Animating normalized data.")
+                motion_np_denormalized = motion_np # Use raw motion if no mean/std available
 
-            model_hyperparams = self.args.get('model_hyperparameters', {})
-            model_to_inspect = self.model.module if isinstance(self.model, torch.nn.DataParallel) else self.model
-            num_j_viz = model_hyperparams.get('num_joints_for_geom', model_to_inspect.njoints)
-            feat_p_j_viz = model_hyperparams.get('features_per_joint_for_geom', model_to_inspect.nfeats)
+            # Check if model has attributes for joints/features
+            num_j_viz = getattr(model_to_use_for_sampling, 'njoints', self.num_joints_for_geom)
+            feat_p_j_viz = getattr(model_to_use_for_sampling, 'nfeats', self.features_per_joint_for_geom)
 
-            # Text and animation filename
-            sanitized_prompt = sanitize_filename(self.sample_generation_prompt)
-            sanitized_prompt = sanitized_prompt[:50].replace(" ", "_")  # Limit length and replace spaces
-            animation_filename = f"epoch{epoch_num}_arm{self.sample_generation_armature_id}_{sanitized_prompt}.gif"
+            sanitized_prompt_fn = sanitize_filename(self.sample_generation_prompt, max_len=40)
+            model_type_suffix = "_best" if self.sample_generation_use_best_model and checkpoint_to_load_path else "_curr"
+            animation_filename = f"epoch{epoch_num}_arm{self.sample_generation_armature_id}{model_type_suffix}_{sanitized_prompt_fn}.gif"
             animation_output_path = self.sample_generation_output_dir / animation_filename
             
-            if motion_np.shape[1] == num_j_viz * feat_p_j_viz:
-                motion_reshaped = motion_np.reshape(self.sample_generation_num_frames, num_j_viz, feat_p_j_viz)
-                # motion_centered = motion_reshaped - motion_reshaped[:, 0:1, :] # Optional centering
+            # Check if motion_np_denormalized has the expected shape
+            expected_flat_features = num_j_viz * feat_p_j_viz
+            if motion_np_denormalized.shape[0] == self.sample_generation_num_frames and \
+               motion_np_denormalized.shape[1] == expected_flat_features:
+                motion_reshaped = motion_np_denormalized.reshape(self.sample_generation_num_frames, num_j_viz, feat_p_j_viz)
                 try:
                     create_motion_animation(
-                        motion_data_frames=motion_reshaped, # or motion_centered
-                        kinematic_chain=T2M_KINEMATIC_CHAIN, # Make sure this is defined/imported
+                        motion_data_frames=motion_reshaped,
+                        kinematic_chain=T2M_KINEMATIC_CHAIN,
                         output_filename=str(animation_output_path),
-                        fps=30 # Or from config
+                        fps=self.sample_render_fps
                     )
                     logger.info(f"Saved sample animation to {animation_output_path}")
                 except Exception as e:
-                    logger.error(f"Failed to create sample animation for epoch {epoch_num}: {e}")
+                    logger.error(f"Failed to create sample animation for epoch {epoch_num}: {e}", exc_info=True)
             else:
-                 logger.warning(f"Sample shape mismatch for animation: got {motion_np.shape[1]} features, expected {num_j_viz*feat_p_j_viz}.")
+                 logger.warning(f"Sample shape mismatch for animation: motion_np_denormalized shape {motion_np_denormalized.shape}, "
+                                f"expected frames {self.sample_generation_num_frames}, "
+                                f"expected flat features {expected_flat_features} (for {num_j_viz}j x {feat_p_j_viz}f). Skipping animation.")
 
+        model_to_use_for_sampling.train(current_model_training_state) # Restore original training state
+        if model_to_use_for_sampling is not self.model and hasattr(self.model, 'train'): # Check if the trained model has a train method
+             self.model.train(current_model_training_state if current_model_training_state is not None else True)
 
-        self.model.train(current_model_training_state) # Restore model training state
         logger.info(f"Inspection sample generation attempt complete for epoch {epoch_num}.")
