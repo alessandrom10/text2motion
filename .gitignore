@@ -176,3 +176,4 @@ cython_debug/
 # data folder
 data/
 img/
+experiments_output/
