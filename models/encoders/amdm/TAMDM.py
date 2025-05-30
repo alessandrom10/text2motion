@@ -149,25 +149,18 @@ class OutputProcess(nn.Module):
         self.poseFinal = nn.Linear(self.latent_dim, self.output_feats)
         logger.info(f"OutputProcess: Initialized for '{self.data_rep}', output_feats={self.output_feats}, latent_dim={self.latent_dim}.")
 
-    def forward(self, output_from_transformer: torch.Tensor, batch_first_input_from_transformer: bool) -> torch.Tensor:
+    def forward(self, output_from_backbone: torch.Tensor, batch_first_output_from_backbone: bool) -> torch.Tensor:
         """
-        Processes the output from the Transformer.
-
-        :param output_from_transformer: Tensor from the Transformer.
-                                        Shape: [batch_size, num_frames, latent_dim] if batch_first_input_from_transformer.
-                                        Shape: [num_frames, batch_size, latent_dim] otherwise.
-        :param batch_first_input_from_transformer: Indicates if the input 'output_from_transformer' is batch-first.
-        :return: Final motion tensor. Shape: [batch_size, num_frames, output_feats].
+        Projects the output from the backbone to the motion feature space.
+        :param output_from_backbone: Output tensor from the backbone of shape [nframes, bs, latent_dim] or [bs, nframes, latent_dim].
+        :param batch_first_output_from_backbone: If True, output is [bs, nframes, latent_dim]. If False, output is [nframes, bs, latent_dim].
+        :return: Projected output tensor of shape [nframes, bs, output_feats] or [bs, nframes, output_feats].
         """
-        projected_output = self.poseFinal(output_from_transformer) # Shape matches input
-
-        if not batch_first_input_from_transformer:
-            # Input was [nframes, bs, output_feats], permute to [bs, nframes, output_feats]
+        projected_output = self.poseFinal(output_from_backbone)
+        if not batch_first_output_from_backbone:
             final_output_motion = projected_output.permute(1, 0, 2)
         else:
-            # Input was already [bs, nframes, output_feats]
             final_output_motion = projected_output
-        
         return final_output_motion
 
 
@@ -363,8 +356,8 @@ class ArmatureMDM(nn.Module):
 
         self.project_armature_for_cond_transformer = nn.Linear(armature_embedding_dim, self.latent_dim)
         
-        cond_num_layers = cond_transformer_config.get('num_layers', max(1, self.model.num_layers // 4 if hasattr(self.model, 'num_layers') else 2))
-        cond_num_heads = cond_transformer_config.get('num_heads', max(1, self.model.num_heads // 2 if hasattr(self.model, 'num_heads') else 2))
+        cond_num_layers = cond_transformer_config.get('num_layers', 4)
+        cond_num_heads = cond_transformer_config.get('num_heads', 4)
         cond_ff_size_factor = cond_transformer_config.get('ff_size_factor', 2)
         cond_ff_size = self.latent_dim * cond_ff_size_factor
         cond_dropout = cond_transformer_config.get('dropout', shared_dropout)
