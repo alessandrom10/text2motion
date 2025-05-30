@@ -28,7 +28,7 @@ if str(project_root / "utils") not in sys.path:
 
 
 # --- Import your definitions ---
-from AMDM import (
+from TAMDM import (
     ArmatureMDM,
     PositionalEncoding,
     TimestepEmbedder,
@@ -226,22 +226,27 @@ def main_training_and_generation_loop(config_path: Path, generation_text: str, g
         data_rep=model_cfg.get('data_rep'),
         njoints=model_cfg.get('njoints'),
         nfeats_per_joint=model_cfg.get('nfeats_per_joint'),
-        num_motion_features=model_cfg.get('num_motion_features_actual'),
+        num_motion_features=dataset_num_motion_features,
         latent_dim=model_cfg.get('latent_dim'),
-        ff_size=model_cfg.get('ff_size'),
+        arch=model_cfg.get('arch', 'trans_enc'),
         num_layers=model_cfg.get('num_layers'),
         num_heads=model_cfg.get('num_heads'),
+        ff_size=model_cfg.get('ff_size'),
         dropout=model_cfg.get('dropout'),
         activation=model_cfg.get('activation', 'gelu'),
+        batch_first_transformer=model_cfg.get('batch_first_transformer', False),
+
+        conditioning_integration_mode=model_cfg.get('conditioning_integration_mode', "mlp"),
+        armature_integration_policy=model_cfg.get('armature_integration_policy', "add_refined"),
+        conditioning_transformer_config=model_cfg.get('conditioning_transformer_config', {}),
+
         sbert_embedding_dim=model_cfg.get('sbert_embedding_dim'),
         max_armature_classes=model_cfg.get('max_armature_classes'),
         armature_embedding_dim=model_cfg.get('armature_embedding_dim'),
         armature_mlp_hidden_dims=model_cfg.get('armature_mlp_hidden_dims'),
         max_seq_len_pos_enc=model_cfg.get('max_seq_len_pos_enc'),
-        text_cond_mask_prob=model_cfg.get('text_cond_mask_prob', 0.1),
+        text_cond_mask_prob=model_cfg.get('text_cond_mask_prob', model_cfg.get('cond_mask_prob', 0.1)),
         armature_cond_mask_prob=model_cfg.get('armature_cond_mask_prob', 0.1),
-        arch=model_cfg.get('arch', 'trans_enc'),
-        batch_first_transformer=model_cfg.get('batch_first_transformer', False)
     )
 
     armature_mdm_model = armature_mdm_model_base.to(device)
@@ -337,8 +342,13 @@ def main_training_and_generation_loop(config_path: Path, generation_text: str, g
         text_cond_mask_prob=model_cfg_loaded.get('text_cond_mask_prob', 0.1),
         armature_cond_mask_prob=model_cfg_loaded.get('armature_cond_mask_prob', 0.1),
         arch=model_cfg_loaded.get('arch', 'trans_enc'),
-        batch_first_transformer=model_cfg_loaded.get('batch_first_transformer', False)
+        batch_first_transformer=model_cfg_loaded.get('batch_first_transformer', False),
+
+        conditioning_integration_mode=model_cfg_loaded.get('conditioning_integration_mode', "mlp"),
+        armature_integration_policy=model_cfg_loaded.get('armature_integration_policy', "add_refined"),
+        conditioning_transformer_config=model_cfg_loaded.get('conditioning_transformer_config', {})
     ).to(device)
+
     generation_model.load_state_dict(checkpoint['model_state_dict'])
     generation_model.eval()
     logger.info("Model for generation loaded.")

@@ -39,9 +39,9 @@ model_hyperparameters:
   # Architecture (aligned with MDM and your ArmatureMDM)
   latent_dim: 512             # Your latent dimension
   ff_size: 1024               # FeedForward size in the Transformer
-  num_layers: 10               # Number of layers in TransformerEncoder
+  num_layers: 8               # Number of layers in TransformerEncoder
   num_heads: 4                # Number of attention heads
-  dropout: 0.05                # General dropout
+  dropout: 0.05               # General dropout
   activation: "gelu"          # Activation function (MDM uses gelu)
   arch: "trans_enc"           # Architecture (MDM: 'trans_enc', 'trans_dec', 'gru')
                              # Our ArmatureMDM is based on 'trans_enc'
@@ -66,6 +66,22 @@ model_hyperparameters:
   # Parameters for geometric/kinematic losses (e.g., SMPL joints)
   num_joints_for_geom: 22                # Number of joints for L_foot, etc.
   features_per_joint_for_geom: 3
+
+
+  conditioning_integration_mode: "transformer"
+  armature_integration_policy: "add_refined"
+
+  # Parameters for ArmatureMDM's mini-transformer
+  conditioning_transformer_config:
+    num_layers: 2
+    num_heads: 2
+    ff_size_factor: 2                 # ff_size mini-TF = latent_dim * ff_size_factor
+    dropout: 0.1
+    activation: "gelu"
+    batch_first: False
+    aggregation_method: "mean"
+    use_positional_encoding: False
+    norm_first: False 
 
 training_hyperparameters:
   batch_size: 64
@@ -93,6 +109,7 @@ training_hyperparameters:
   sample_generation_num_frames: 120     # Length of generated sample
   sample_generation_cfg_scale: 2.5      # CFG scale used in sample generation
   sample_generation_const_noise: False  # Whether to use constant noise for samples
+  sample_generation_use_best_model: false # Whether to use the best model for sample generation
 
 main_x0_loss_config: # Configuration for the main x0 reconstruction loss
   timestep_weighting:

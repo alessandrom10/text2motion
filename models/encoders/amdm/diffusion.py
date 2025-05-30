@@ -9,7 +9,7 @@ from typing import Any, Dict, Optional, Callable, Tuple
 import numpy as np
 import torch
 from tqdm import tqdm
-from AMDM import ArmatureMDM
+from TAMDM import ArmatureMDM
 from torch import nn
 
 logger = logging.getLogger(__name__)
