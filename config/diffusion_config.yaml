@@ -98,7 +98,7 @@ training_hyperparameters:
   save_interval_epochs: 10        # Save a model checkpoint every N epochs.
   
   # Sample generation during training
-  generate_sample_every_n_epochs: 5  # Generate a sample GIF every N epochs (0 to disable).
+  generate_sample_every_n_epochs: 40  # Generate a sample GIF every N epochs (0 to disable).
   sample_generation_prompt: "a person is jumping excitedly" # Default text prompt for these samples.
   sample_generation_armature_id: 1  # Default armature ID for these samples.
   sample_generation_num_frames: 120 # Length of the generated sample animation.
