@@ -384,7 +384,6 @@ def generate_and_save_sbert_embeddings(
         logger.error(f"Failed to save SBERT embeddings to {output_embeddings_path}: {e}")
 
 
-T2M_KINEMATIC_CHAIN = [[0, 2, 5, 8, 11], [0, 1, 4, 7, 10], [0, 3, 6, 9, 12, 15], [9, 14, 17, 19, 21], [9, 13, 16, 18, 20]]
 
 def create_motion_animation(
     motion_data_frames: np.ndarray, # Expects (num_frames, num_joints, 3)
@@ -392,7 +391,8 @@ def create_motion_animation(
     output_filename: str = 'generated_animation.gif',
     fps: int = 30,
     unit_conversion_factor: Optional[float] = None,
-    y_z_swap: bool = True
+    y_z_swap: bool = True,
+    title: Optional[str] = None
 ) -> FuncAnimation:
     """
     Creates and saves/displays a 3D skeleton animation from motion data.
@@ -405,8 +405,10 @@ def create_motion_animation(
     :param unit_conversion_factor: Factor to multiply joint coordinates by (e.g., for mm to m).
                                    If None, no conversion is applied.
     :param y_z_swap: If True, swaps Y and Z coordinates for display.
+    :param title: Optional title for the animation. If None, no title is set.
     :return: The Matplotlib FuncAnimation object.
     """
+    fig, ax = plt.subplots()
     processed_motion = motion_data_frames.copy()
     if unit_conversion_factor is not None:
         processed_motion = processed_motion * unit_conversion_factor
@@ -440,7 +442,6 @@ def create_motion_animation(
     ax.set_box_aspect((1,1,1))
     ax.view_init(elev=20, azim=120)
     # ax.set_axis_off() # Uncomment to turn off axis lines and labels
-
     bones = []
     for chain_part in kinematic_chain:
         for i in range(len(chain_part) - 1):
@@ -450,6 +451,9 @@ def create_motion_animation(
     lines = [ax.plot([], [], [], 'blue', linewidth=1.5, alpha=0.8)[0] for _ in bones]
 
     num_frames_total = processed_motion.shape[0]
+
+    if title:
+        ax.set_title(title, wrap=True)
 
     def init_anim():
         scat._offsets3d = ([], [], [])
