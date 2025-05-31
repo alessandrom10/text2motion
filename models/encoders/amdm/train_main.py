@@ -26,67 +26,12 @@ if str(project_root / "dataset") not in sys.path:
 if str(project_root / "utils") not in sys.path:
     sys.path.insert(0, str(project_root / "utils"))
 
-
-# --- Import your definitions ---
-from TAMDM import (
-    ArmatureMDM,
-    PositionalEncoding,
-    TimestepEmbedder,
-    InputProcess,
-    OutputProcess
-)
-from AMDMTrainer import (
-    ADMTrainer as ADMTrainer,
-    GaussianDiffusionTrainerUtil,
-    UniformSampler
-)
-from dataset_loader import (
-    MyTextToMotionDataset as MyTextToMotionDataset,
-    collate_motion_data_revised
-)
-from diffusion import (
-    GaussianDiffusionSamplerUtil,
-    generate_motion_mdm_style
-)
-from diffusion_utils import (
-     load_armature_config, setup_logging, get_bone_mask_for_armature,
-     create_motion_animation,
-     T2M_KINEMATIC_CHAIN
-)
-
-# --- Beta Schedule ---
-def get_named_beta_schedule(schedule_name: str, num_diffusion_timesteps: int, scale_betas: float = 1.) -> np.ndarray:
-    """
-    Get a pre-defined beta schedule for the diffusion process.
-
-    :param schedule_name: Name of the schedule. Supported: "linear", "cosine".
-    :param num_diffusion_timesteps: The number of diffusion timesteps.
-    :param scale_betas: Factor to scale the betas.
-    :return: A numpy array of betas.
-    :raises NotImplementedError: If the schedule_name is unknown.
-    """
-    if schedule_name == "linear":
-        scale = scale_betas * 1000 / num_diffusion_timesteps
-        beta_start = scale * 0.0001
-        beta_end = scale * 0.02
-        return np.linspace(
-            beta_start, beta_end, num_diffusion_timesteps, dtype=np.float64
-        )
-    elif schedule_name == "cosine":
-        def betas_for_alpha_bar(num_diffusion_timesteps_inner: int, alpha_bar_fn: Callable[[float], float], max_beta: float = 0.999) -> np.ndarray:
-            betas_out = []
-            for i in range(num_diffusion_timesteps_inner):
-                t1 = i / num_diffusion_timesteps_inner
-                t2 = (i + 1) / num_diffusion_timesteps_inner
-                betas_out.append(min(1 - alpha_bar_fn(t2) / alpha_bar_fn(t1), max_beta))
-            return np.array(betas_out)
-
-        return betas_for_alpha_bar(
-            num_diffusion_timesteps,
-            lambda t: math.cos((t + 0.008) / 1.008 * math.pi / 2) ** 2,
-        )
-    else:
-        raise NotImplementedError(f"unknown beta schedule: {schedule_name}")
+# --- Importing Modules ---
+from TAMDM import ArmatureMDM
+from AMDMTrainer import ADMTrainer, GaussianDiffusionTrainerUtil
+from dataset_loader import MyTextToMotionDataset, collate_motion_data_revised
+from motion_generator import MotionGenerator, get_named_beta_schedule
+from diffusion_utils import load_armature_config, setup_logging, get_bone_mask_for_armature
 
 
 logger = logging.getLogger(__name__)
@@ -116,6 +61,7 @@ def main_training_and_generation_loop(config_path: Path, generation_text: str, g
     train_cfg = config.get('training_hyperparameters', {})
     diffusion_cfg = config.get('diffusion_hyperparameters', {})
     dataset_cfg = config.get('dataset_parameters', {})
+    gen_params_cfg = config.get('generation_parameters', {})
 
     run_name = config.get('run_name', 'armature_mdm_run')
     model_save_dir_relative = Path(paths_cfg.get('model_save_dir', 'experiments_output'))
@@ -135,9 +81,10 @@ def main_training_and_generation_loop(config_path: Path, generation_text: str, g
         return
 
     betas_for_dataset_np = get_named_beta_schedule(
-        schedule_name=diffusion_cfg.get('noise_schedule_mdm', 'linear'),
+        schedule_name=diffusion_cfg.get('noise_schedule_mdm', 'cosine'),
         num_diffusion_timesteps=diffusion_cfg.get('num_diffusion_timesteps', 1000)
     )
+
     alphas_for_dataset_np = 1.0 - betas_for_dataset_np
     alphas_cumprod_for_dataset = torch.tensor(np.cumprod(alphas_for_dataset_np, axis=0), dtype=torch.float32)
 
@@ -262,6 +209,7 @@ def main_training_and_generation_loop(config_path: Path, generation_text: str, g
 
     diffusion_util_trainer = GaussianDiffusionTrainerUtil(betas=betas_for_dataset_np)
 
+    # LR Scheduler Setup
     temp_optimizer_for_scheduler = optim.AdamW(armature_mdm_model.parameters(), lr=train_cfg.get('learning_rate'))
     lr_scheduler_instance = None
     if train_cfg.get('use_lr_scheduler', False) and val_loader is not None :
@@ -272,13 +220,18 @@ def main_training_and_generation_loop(config_path: Path, generation_text: str, g
             verbose=True )
 
     trainer = ADMTrainer(
-        config=config, model=armature_mdm_model, diffusion_util=diffusion_util_trainer,
-        train_loader=train_loader, get_bone_mask_fn=get_bone_mask_for_armature,
+        config=config,
+        original_config_path=config_path,
+        model=armature_mdm_model, 
+        diffusion_util=diffusion_util_trainer,
+        train_loader=train_loader, 
+        get_bone_mask_fn=get_bone_mask_for_armature,
         model_save_dir=model_save_dir,
-        armature_config_data=loaded_armature_config, val_loader=val_loader,
+        armature_config_data=loaded_armature_config, 
+        val_loader=val_loader,
         lr_scheduler=lr_scheduler_instance)
 
-
+    # Optimizer Setup
     if is_data_parallel:
         params_to_adam = armature_mdm_model.module.parameters()
     else:
@@ -299,7 +252,8 @@ def main_training_and_generation_loop(config_path: Path, generation_text: str, g
     trainer.run_loop()
     logger.info("Training completed.")
 
-    logger.info("Starting generation phase...")
+    # 2. Generation Phase
+    logger.info("Starting post-training generation phase...")
 
     final_model_filename = f"{trainer.model_filename_base}_final.pth"
     best_model_filename = f"{trainer.model_filename_base}_best.pth"
@@ -313,110 +267,54 @@ def main_training_and_generation_loop(config_path: Path, generation_text: str, g
         logger.error(f"No trained model ({best_model_filename} or {final_model_filename}) found in {trainer.model_save_dir}. Aborting generation.")
         return
 
-    logger.info(f"Loading model for generation from: {model_load_path}")
-    checkpoint = torch.load(str(model_load_path), map_location=device, weights_only=True)
-    loaded_config_from_ckpt = checkpoint.get('config', config)
-    model_cfg_loaded = loaded_config_from_ckpt.get('model_hyperparameters', model_cfg)
-
-    if "flat" in model_cfg_loaded.get('data_rep', ""):
-        gen_actual_input_feats_loaded = model_cfg_loaded.get('num_motion_features_actual')
-    else:
-        gen_actual_input_feats_loaded = model_cfg_loaded.get('njoints') * model_cfg_loaded.get('nfeats_per_joint')
-
-    generation_model = ArmatureMDM(
-        data_rep=model_cfg_loaded.get('data_rep'),
-        njoints=model_cfg_loaded.get('njoints'),
-        nfeats_per_joint=model_cfg_loaded.get('nfeats_per_joint'),
-        num_motion_features=gen_actual_input_feats_loaded,
-        latent_dim=model_cfg_loaded.get('latent_dim'),
-        ff_size=model_cfg_loaded.get('ff_size'),
-        num_layers=model_cfg_loaded.get('num_layers'),
-        num_heads=model_cfg_loaded.get('num_heads'),
-        dropout=model_cfg_loaded.get('dropout', 0.1),
-        activation=model_cfg_loaded.get('activation', 'gelu'),
-        sbert_embedding_dim=model_cfg_loaded.get('sbert_embedding_dim'),
-        max_armature_classes=model_cfg_loaded.get('max_armature_classes'),
-        armature_embedding_dim=model_cfg_loaded.get('armature_embedding_dim'),
-        armature_mlp_hidden_dims=model_cfg_loaded.get('armature_mlp_hidden_dims'),
-        max_seq_len_pos_enc=model_cfg_loaded.get('max_seq_len_pos_enc', 5000),
-        text_cond_mask_prob=model_cfg_loaded.get('text_cond_mask_prob', 0.1),
-        armature_cond_mask_prob=model_cfg_loaded.get('armature_cond_mask_prob', 0.1),
-        arch=model_cfg_loaded.get('arch', 'trans_enc'),
-        batch_first_transformer=model_cfg_loaded.get('batch_first_transformer', False),
-
-        conditioning_integration_mode=model_cfg_loaded.get('conditioning_integration_mode', "mlp"),
-        armature_integration_policy=model_cfg_loaded.get('armature_integration_policy', "add_refined"),
-        conditioning_transformer_config=model_cfg_loaded.get('conditioning_transformer_config', {})
-    ).to(device)
-
-    generation_model.load_state_dict(checkpoint['model_state_dict'])
-    generation_model.eval()
-    logger.info("Model for generation loaded.")
-
-    diffusion_sampler = GaussianDiffusionSamplerUtil(
-        betas=betas_for_dataset_np,
-        model_mean_type=diffusion_cfg.get('model_mean_type_mdm', 'START_X'),
-        model_var_type=diffusion_cfg.get('model_var_type_mdm', 'FIXED_SMALL')
-    )
-
     try:
-        sbert_processor_gen = SentenceTransformer(model_cfg.get('sbert_model_name'), device=device)
-        gen_text_embedding = sbert_processor_gen.encode(generation_text, convert_to_tensor=True)
+        logger.info(f"Initializing MotionGenerator with model: {model_load_path}")
+        # config_path is the main YAML config path
+        motion_generator = MotionGenerator(
+            config_path=config_path, 
+            model_checkpoint_path=model_load_path,
+            device_str=str(device)
+        )
+
+        num_frames_to_generate = gen_params_cfg.get('num_frames_to_generate', 120)
+        cfg_scale_final_gen = gen_params_cfg.get('cfg_scale', 2.5)
+        const_noise_final_gen = gen_params_cfg.get('const_noise_for_sampling', False) # Get from gen_params if specific
+        render_fps_final_gen = gen_params_cfg.get('render_fps', 20)
+
+
+        logger.info(f"Generating motion for: '{generation_text}', armature ID: {generation_armature_id}")
+        generated_motion_np = motion_generator.generate_single_motion(
+            text_prompt=generation_text,
+            armature_id=generation_armature_id,
+            num_frames=num_frames_to_generate,
+            cfg_scale=cfg_scale_final_gen,
+            const_noise_for_sampling=const_noise_final_gen
+            # clip_denoised, progress_bar use defaults or can be exposed
+        )
+
+        if generated_motion_np is not None:
+            gen_output_dir = model_save_dir / "generated_samples_after_training" # Specific subdir
+            gen_output_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Sanitize prompt for filename
+            safe_prompt_snippet = "".join(c if c.isalnum() else "_" for c in generation_text[:50])
+            animation_filename = f"gen_arm{generation_armature_id}_cfg{cfg_scale_final_gen}_{run_name}_{safe_prompt_snippet}.gif"
+            animation_output_path = gen_output_dir / animation_filename
+
+            motion_generator.save_motion_as_gif(
+                motion_data_frames=generated_motion_np,
+                output_path_abs=animation_output_path,
+                armature_id=generation_armature_id, # For kinematic chain
+                title=generation_text,
+                fps=render_fps_final_gen
+            )
+        else:
+            logger.warning("Post-training generation failed to produce motion.")
+
     except Exception as e:
-        logger.error(f"SBERT error for generation text: {e}. Using dummy tensor.")
-        gen_text_embedding = torch.randn(model_cfg.get('sbert_embedding_dim')).to(device)
+        logger.error(f"Error during post-training generation phase: {e}", exc_info=True)
 
-    y_conditions_for_generation = {
-        'text_embeddings_batch': gen_text_embedding.unsqueeze(0).to(device),
-        'armature_class_ids': torch.tensor([generation_armature_id], dtype=torch.long).to(device),
-        'mask': None,
-        'cfg_scale': config.get('generation_params', {}).get('cfg_scale', 2.5),
-    }
-    num_frames_to_generate = config.get('generation_params', {}).get('num_frames_to_generate', 120)
-
-    logger.info(f"Generating motion for: '{generation_text}', armature ID: {generation_armature_id}")
-    generated_motion = generate_motion_mdm_style(
-        armature_mdm_model=generation_model,
-        diffusion_sampler_util=diffusion_sampler,
-        y_conditions=y_conditions_for_generation,
-        num_frames=num_frames_to_generate,
-        device=str(device)
-    )
-    logger.info(f"Motion generated with shape: {generated_motion.shape}")
-
-    gen_output_dir = model_save_dir / "generated_samples"
-    gen_output_dir.mkdir(exist_ok=True)
-    animation_filename = f"gen_arm{generation_armature_id}_cfg{y_conditions_for_generation['cfg_scale']}_{run_name}_while_{generation_text[:50].replace(' ', '_')}.gif"
-    animation_output_path = gen_output_dir / animation_filename
-
-    motion_np = generated_motion.squeeze(0).cpu().numpy()
-
-    if hasattr(train_dataset, 'dataset_mean') and hasattr(train_dataset, 'dataset_std'):
-        mean_for_denorm = train_dataset.dataset_mean
-        std_for_denorm = np.where(train_dataset.dataset_std == 0, 1e-8, train_dataset.dataset_std)
-        motion_np_denormalized = motion_np * std_for_denorm + mean_for_denorm
-    else:
-        logger.warning("Dataset mean/std not found for de-normalization. Visualizing normalized output.")
-        motion_np_denormalized = motion_np
-
-    num_j_viz = model_cfg_loaded.get('num_joints_for_geom', generation_model.njoints)
-    feat_p_j_viz = model_cfg_loaded.get('features_per_joint_for_geom', generation_model.nfeats)
-
-    if motion_np_denormalized.shape[1] == num_j_viz * feat_p_j_viz:
-        motion_reshaped = motion_np_denormalized.reshape(num_frames_to_generate, num_j_viz, feat_p_j_viz)
-        motion_to_animate = motion_reshaped
-
-        logger.info(f"Creating animation: {animation_output_path}")
-        create_motion_animation(
-            motion_data_frames=motion_to_animate,
-            kinematic_chain=T2M_KINEMATIC_CHAIN,
-            output_filename=str(animation_output_path),
-            fps=config.get('generation_params', {}).get('render_fps', 20) )
-        logger.info(f"Animation saved: {animation_output_path}")
-    else:
-        logger.warning(f"Denormalized output shape ({motion_np_denormalized.shape[1]}) not suitable for reshape to ({num_j_viz} joints, {feat_p_j_viz} feat/joint). Expected {num_j_viz * feat_p_j_viz} features. Skipping animation.")
-
-    logger.info("Main script completed.")
+    logger.info("Main script (train_main.py) completed.")
 
 
 if __name__ == "__main__":
