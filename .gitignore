@@ -175,7 +175,3 @@ cython_debug/
 
 # data folder
 data/
-experiments_output/
-img/
-Best-Models/
-batch_generated_motions/
