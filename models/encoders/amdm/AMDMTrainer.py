@@ -14,7 +14,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from pathlib import Path
-from AMDM import ArmatureMDM
+from TAMDM import ArmatureMDM
 from sentence_transformers import SentenceTransformer
 
 from motion_generator import GaussianDiffusionSamplerUtil, get_named_beta_schedule, MotionGenerator
