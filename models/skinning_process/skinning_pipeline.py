@@ -1,0 +1,129 @@
+import numpy as np
+import torch
+import networkx as nx
+from SKINNING import SKINNET, skinnet  # Your SKINNET class
+from torch_geometric.data import Data  # Optional, if using PyG for graph data
+
+def build_skeleton_graph(bones_edges):
+    """
+    Build the full skeleton graph from bone edges.
+    bones_edges: list of tuples [(bone_idx1, bone_idx2), ...]
+    """
+    G = nx.Graph()
+    G.add_edges_from(bones_edges)
+    return G
+
+def exclude_mst_edges(graph):
+    """
+    Compute MST and exclude MST edges from graph edges,
+    returning edges *not* in MST.
+    """
+    mst = nx.minimum_spanning_tree(graph)
+    mst_edges = set(mst.edges())
+    non_mst_edges = [e for e in graph.edges() if e not in mst_edges and (e[1], e[0]) not in mst_edges]
+    return non_mst_edges
+
+def build_mesh_graph(vertex_adjacency):
+    """
+    vertex_adjacency: list of (v1, v2) edges representing mesh connectivity
+    """
+    G_mesh = nx.Graph()
+    G_mesh.add_edges_from(vertex_adjacency)
+    return G_mesh
+
+def graph_to_edge_index(graph):
+    """
+    Convert NetworkX graph edges to edge_index tensor for PyG / GNN
+    Returns a torch.LongTensor of shape (2, num_edges)
+    """
+    edges = list(graph.edges())
+    if len(edges) == 0:
+        return torch.empty((2, 0), dtype=torch.long)
+    edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
+    return edge_index
+
+def normalize_skin_weights(weights):
+    """
+    Normalize skinning weights so each vertex's weights sum to 1
+    weights: Tensor shape [num_vertices, num_bones]
+    """
+    weights = torch.relu(weights)  # Optional: ensure non-negative
+    weights_sum = weights.sum(dim=1, keepdim=True) + 1e-8
+    normalized = weights / weights_sum
+    return normalized
+
+def linear_blend_skinning(vertices, skin_weights, bone_transforms):
+    """
+    vertices: Tensor [num_vertices, 3]
+    skin_weights: Tensor [num_vertices, num_bones]
+    bone_transforms: Tensor [num_bones, 4, 4] (homogeneous transforms)
+    
+    Returns deformed_vertices: Tensor [num_vertices, 3]
+    """
+    num_vertices, num_bones = skin_weights.shape
+    vertices_h = torch.cat([vertices, torch.ones(num_vertices, 1)], dim=1)  # to homogeneous [x,y,z,1]
+    deformed = torch.zeros_like(vertices_h)
+
+    for b in range(num_bones):
+        T = bone_transforms[b]  # [4,4]
+        w = skin_weights[:, b].unsqueeze(1)  # [num_vertices,1]
+        transformed = (vertices_h @ T.T)  # [num_vertices, 4]
+        deformed += w * transformed
+
+    return deformed[:, :3]  # drop homogeneous coord
+
+# Main skinning pipeline
+
+def skinning_pipeline(mesh_vertices, vertex_adjacency, bones_edges, bone_transforms, nearest_bone, use_Dg, use_Lf):
+    """
+    mesh_vertices: Tensor [num_vertices, 3]
+    vertex_adjacency: list of (v1, v2)
+    bones_edges: list of (bone_idx1, bone_idx2)
+    bone_transforms: Tensor [num_bones, 4, 4]
+    nearest_bone: int, number of nearest bones considered
+    use_Dg, use_Lf: flags controlling input features (from skinning.py)
+    """
+
+    # Step 1: Build skeleton graph and exclude MST edges
+    skeleton_graph = build_skeleton_graph(bones_edges)
+    non_mst_edges = exclude_mst_edges(skeleton_graph)
+    non_mst_graph = nx.Graph()
+    non_mst_graph.add_edges_from(non_mst_edges)
+
+    # Step 2: Build mesh graph
+    mesh_graph = build_mesh_graph(vertex_adjacency)
+
+    # Step 3: Convert graphs to edge_index format for GNN
+    tpl_edge_index = graph_to_edge_index(non_mst_graph)   # skeleton graph edges (non-MST)
+    geo_edge_index = graph_to_edge_index(mesh_graph)      # mesh graph edges
+
+    # Step 4: Prepare skin_input feature tensor (dummy example, real input depends on your data)
+    # Usually contains geometric features, bone-related features per vertex
+    # For now, let's create a placeholder tensor with the correct shape:
+    num_vertices = mesh_vertices.shape[0]
+    skin_input_dim = 3 + nearest_bone * 8  # max dimension according to skinning.py
+    skin_input = torch.randn(num_vertices, skin_input_dim)  # Replace with real feature construction!
+
+    # Step 5: Build data object (depending on your framework)
+    class DataObj:
+        pass
+    data = DataObj()
+    data.pos = mesh_vertices
+    data.skin_input = skin_input
+    data.tpl_edge_index = tpl_edge_index
+    data.geo_edge_index = geo_edge_index
+    data.batch = torch.zeros(num_vertices, dtype=torch.long)  # assuming single mesh, batch=0
+
+    # Step 6: Initialize SKINNET and predict skin weights
+    model = skinnet(nearest_bone=nearest_bone, use_Dg=use_Dg, use_Lf=use_Lf)
+    model.eval()  # set to eval mode if not training
+    with torch.no_grad():
+        skin_weights_raw = model(data)  # shape [num_vertices, nearest_bone]
+
+    # Step 7: Normalize skin weights
+    skin_weights = normalize_skin_weights(skin_weights_raw)
+
+    # Step 8: Apply linear blend skinning
+    deformed_vertices = linear_blend_skinning(mesh_vertices, skin_weights, bone_transforms)
+
+    return deformed_vertices, skin_weights
