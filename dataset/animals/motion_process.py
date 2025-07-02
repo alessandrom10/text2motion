@@ -1,3 +1,4 @@
+#   pip install git+https://github.com/inbar-2344/Motion.git
 import BVH
 from Animation import *
 from InverseKinematics import animation_from_positions

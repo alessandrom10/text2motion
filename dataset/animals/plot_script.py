@@ -6,7 +6,7 @@ from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 import mpl_toolkits.mplot3d.axes3d as p3
 import os
 from textwrap import wrap
-from moviepy.editor import VideoClip
+from moviepy.editor import VideoClip        # moviepy==1.0.3
 from pathlib import Path
 
 def mplfig_to_npimage(fig):
