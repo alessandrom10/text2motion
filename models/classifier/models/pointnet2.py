@@ -91,5 +91,5 @@ class JointPredictionLoss(nn.Module):
 
     def forward(self, cls_logits, labels, pred, target, mask):
         class_loss = 0.1 * self.class_loss_fn(cls_logits, labels)
-        joint_loss = torch.sum(torch.abs(pred - target)) / (mask.sum() * 3)
+        joint_loss = F.l1_loss(pred, target, reduction='sum') / (mask.sum() * 3)
         return class_loss + joint_loss

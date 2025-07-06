@@ -85,9 +85,10 @@ def train_one_epoch(model, optimizer, train_loader, criterion):
         losses.append(l1_loss.item())
     return np.mean(mean_correct), np.mean(losses)
 
-def evaluate_model(model, test_loader, criterion, epoch):
+def evaluate_model(model, test_loader, criterion, epoch, best_loss=None):
     model.eval()
     mean_correct = []
+    losses_l1 = []
     losses = []
     with torch.no_grad():
         for points, label, mask, target in tqdm(test_loader, smoothing=0.9):
@@ -105,7 +106,10 @@ def evaluate_model(model, test_loader, criterion, epoch):
             mean_correct.append(correct / float(points.size()[0]))
 
             l1_loss = torch.sum(torch.abs(joints_pred - target)) / (mask.sum() * 3)
-            losses.append(l1_loss.item())
+            losses_l1.append(l1_loss.item())
+            
+            loss = criterion(cls_logits, label, joints_pred, target, mask)
+            losses.append(loss.item())
 
             if epoch > 197:
                 pc = points[0].transpose(0, 1).cpu().numpy()
@@ -113,7 +117,7 @@ def evaluate_model(model, test_loader, criterion, epoch):
                 joints_true = target[0][mask[0].bool()].cpu().numpy()
                 plot_point_cloud_with_joints(pc, joints, joints_true)
 
-    return np.mean(mean_correct), np.mean(losses)
+    return np.mean(mean_correct), np.mean(losses_l1), np.mean(losses)
 
 def train_loop(args):
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
@@ -128,13 +132,23 @@ def train_loop(args):
 
     model, criterion, start_epoch = initialize_model(args, train_dataset.get_num_classes(), train_dataset.get_num_part(), exp_dir, logger)
     optimizer = initialize_optimizer(args, model)
-
+    best_loss = torch.inf
     for epoch in range(start_epoch, args.epoch):
         lr, momentum = adjust_learning_rate_and_momentum(optimizer, model, epoch, args)
         logger.info(f'Epoch {epoch + 1}: learning rate={lr:.6f}, BN momentum={momentum:.6f}')
 
-        acc_train, loss_train = train_one_epoch(model, optimizer, train_loader, criterion)
-        acc_test, loss_test = evaluate_model(model, test_loader, criterion, epoch)
+        acc_train, lossl1_train = train_one_epoch(model, optimizer, train_loader, criterion)
+        acc_test, lossl1_test, all_loss = evaluate_model(model, test_loader, criterion, epoch, best_loss)
 
-        logger.info(f'Train L1 Loss: {loss_train:.6f}, Accuracy: {acc_train:.6f}')
-        logger.info(f'Test L1 Loss: {loss_test:.6f}, Accuracy: {acc_test:.6f}')
+        if all_loss < best_loss:
+            best_loss = all_loss
+            torch.save({
+                'epoch': epoch + 1,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'loss': all_loss,
+            }, exp_dir / 'checkpoints/best_model.pth')
+            logger.info(f'Saving best model at epoch {epoch + 1} with loss {all_loss:.6f}')
+
+        logger.info(f'Train L1 Loss: {lossl1_train:.6f}, Accuracy: {acc_train:.6f}')
+        logger.info(f'Test L1 Loss: {lossl1_test:.6f}, Accuracy: {acc_test:.6f}')

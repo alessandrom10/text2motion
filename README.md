@@ -1,38 +1,120 @@
-# text2motion
+# Text2Motion
 
-## Dataset Setup
+**Text2Motion** is a deep learning system that translates text descriptions into realistic 3D animations for any given mesh. It automates complex animation workflows with an intelligent, three-stage pipeline:
 
-To get started, create a folder named `data` in the root directory of the project. Inside this folder, place the datasets you intend to use.
+1. *Classification*: The system first analyzes the input 3D mesh to identify its key features and determine the appropriate armature (skeleton).
 
-### DFAUST Dataset
+2. *Skinning*: It then binds the mesh to the armature, creating a "skinned" model ready for realistic deformation.
 
-To use the DFAUST dataset:
+3. *Generation*: Finally, a powerful diffusion model generates fluid and nuanced motion based on your text prompt, bringing the model to life.
 
-1. Download it from the official website: [https://dfaust.is.tue.mpg.de/index.html](https://dfaust.is.tue.mpg.de/index.html).
-2. Inside the `data` folder, include the following files:
+-----
 
-   * `subjects_and_sequences.txt` (available in the DFAUST `scripts` folder)
-   * `registrations_f.hdf5`
-   * `registrations_m.hdf5`
+## Getting Started
 
-Make sure the file structure is organized as follows:
+Follow these instructions to get the project up and running on your local machine.
 
+1. **Setup environment**
+
+    ```bash
+      conda env create -f environment.yaml
+      conda activate text2motion
+    ```
+2. **Download the dataset**
+
+   This project uses the **Truebones Zoo dataset**, a collection of animated animal motions. You can get the dataset for free from the [Truebones Gumroad page](https://truebones.gumroad.com/l/skZMC).
+   After downloading, extract the contents into a directory named `data` within the root of the project. The directory structure should look like this:
+
+   ```
+   text2motion/
+   ├── data/
+   │   └── Truebones_Zoo_dataset/
+   │       └── ... (dataset files)
+   ├── train_classifier.py
+   ├── train_skinning.py
+   ├── train_diffusion.py
+   └── ...
+   ```
+
+3. **Preprocess the dataset**
+
+   To prepare the dataset for training, you must run two distinct preprocessing steps: one for the classification and skinning models, and a second one for the diffusion model.
+
+   ### Preprocessing for Classification and Skinning
+
+   This first step is essential for the classification and skinning models and requires **[Blender](https://www.blender.org/download/)**. You will need to run a script from your terminal that automates the necessary operations within Blender.
+
+   Open a terminal and execute the following command:
+
+   ```bash
+   blender --background --python scripts/preprocessing_script.py
+   ```
+
+   -----
+
+   ### Preprocessing for the Diffusion Model
+
+   The second step prepares the data specifically for training the **diffusion model**. To correctly preprocess the data for the diffusion model, please refer to the detailed documentation and scripts provided in the **[Anytop repository](https://www.google.com/search?q=https.anytop2025.github.io/Anytop-page/)**. You should then put the `truebones_processed` folder in `data`.
+-----
+
+## Usage
+
+### Training the Models
+
+The complete training process involves three distinct stages that must be run **in order**. Each stage trains a separate model that is essential for the final animation pipeline.
+
+1.  **Train the Classifier**
+    This model learns to analyze a 3D mesh and predict its skeletal structure (armature) in the correct positions.
+
+    ```bash
+    python train_classifier.py
+    ```
+
+2.  **Train the Skinning Model**
+    This model learns how to properly bind the mesh to the predicted armature, enabling realistic deformations.
+
+    ```bash
+    python train_skinning.py
+    ```
+
+3.  **Train the Diffusion Model**
+    This model learns to generate the actual motion sequence from a text prompt, which is then applied to the skinned model.
+
+    ```bash
+    python train_diffusion.py
+    ```
+
+-----
+
+### Generating Animations
+
+Once all three models are trained, you can generate a new animation from a text prompt and a static 3D mesh file.
+
+Use the `generate.py` script with your desired text prompt and the path to your input mesh.
+
+```bash
+python -m scripts.generate \
+  --prompt "A dog is running" \
+  --input_mesh "path/to/your/mesh.obj"
 ```
-text2motion/
-├── data/
-│   ├── dfaust/
-│       ├── subjects_and_sequences.txt
-│       ├── registrations_f.hdf5
-│       └── registrations_m.hdf5
-```
 
-### HumanML3D Dataset
+The script will load the trained pipeline, process your mesh and generate the corresponding animation in the folder `output`.
 
-To use HumanML3D dataset:
-1. Download it from the following link: [HumanML3D](https://polimi365-my.sharepoint.com/:u:/g/personal/11016435_polimi_it/ERuJYO7DDyRBl7PwChzVZZsBXui5ir0K3pEEb-WHMH_4yA?e=R5rN3g)
+To visualize it, use blender with the following prompt:
 
-2. Create the folder `HumanML3D` into the `data` folder.
+   ```bash
+   blender --python scripts/visualization_blender.py --animation output/your_animation_folder
+   ```
+-----
 
-3. Extract the two folders (joints and texts) into the `HumanML3D` folder.
+## Acknowledgments
 
-4. Visualize animations using the script in `visualize_skeleton_animation.py`.
+* **[Truebones](https://truebones.gumroad.com/)** for providing the excellent and comprehensive Zoo dataset.
+* **[Anytop](https://anytop2025.github.io/Anytop-page/)**, whose work provided the basis for our preprocessing scripts, visualization tools, and the core of our diffusion model.
+* The authors of **[MDM](https://guytevet.github.io/mdm-page/)** for their insightful ideas that significantly influenced the architecture of our diffusion model.
+* The **[RigNet](https://zhan-xu.github.io/rig-net/)** project for developing the `SkinNet` model, which we have adapted for our skinning process.
+* The creators of **[PointNet++](https://arxiv.org/abs/1706.02413)** for the pioneering network architecture that underpins our classification and joint prediction models.
+
+## License
+This code is distributed under an [MIT LICENSE](LICENSE).
+Note that our code depends on other libraries that have their own respective licenses that must also be followed.
