@@ -26,7 +26,7 @@ def pc_normalize(pc):
     pc = pc / m
     return pc
 
-class PartNormalDataset(Dataset):
+class TruebonesDataset(Dataset):
 
     def __init__(self,root = './data/Truebone_Z-OO', npoints=2500, split='train', class_choice=None, normal_channel=False):
         self.npoints = npoints

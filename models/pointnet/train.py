@@ -7,10 +7,10 @@ import sys
 import importlib
 import shutil
 import numpy as np
-import provider
+import models.pointnet.provider as provider
 from pathlib import Path
 from tqdm import tqdm
-from dataset.dataset_animals import PartNormalDataset, pc_normalize
+from dataset.dataset_pointnet import TruebonesDataset, pc_normalize
 import torch.nn as nn
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
@@ -115,9 +115,9 @@ def main(args):
     log_string(args)
 
 
-    TRAIN_DATASET = PartNormalDataset(npoints=args.npoint, split='train', normal_channel=args.normal)
+    TRAIN_DATASET = TruebonesDataset(npoints=args.npoint, split='train', normal_channel=args.normal)
     trainDataLoader = torch.utils.data.DataLoader(TRAIN_DATASET, batch_size=args.batch_size, shuffle=True, num_workers=10, drop_last=True)
-    TEST_DATASET = PartNormalDataset(npoints=args.npoint, split='test', normal_channel=args.normal)
+    TEST_DATASET = TruebonesDataset(npoints=args.npoint, split='test', normal_channel=args.normal)
     TEST_DATASET.set_seg_classes(TRAIN_DATASET.seg_classes)
     TEST_DATASET.set_part_classes(TRAIN_DATASET.part_classes)
     TEST_DATASET.set_dict_groups(TRAIN_DATASET.dict_groups)
@@ -133,8 +133,8 @@ def main(args):
 
     '''MODEL LOADING'''
     MODEL = importlib.import_module(args.model)
-    shutil.copy("models/" +args.model+'.py', str(exp_dir))
-    shutil.copy("models/" +args.model+'_utils.py', str(exp_dir))
+    shutil.copy("models/pointnet/models/" +args.model+'.py', str(exp_dir))
+    shutil.copy("models/pointnet/models/" +args.model+'_utils.py', str(exp_dir))
 
     classifier = MODEL.PointNetPartSeg(num_classes, seg_classes).cuda()
     criterion = MODEL.get_loss().cuda()
@@ -228,7 +228,7 @@ def main(args):
             joints_pred = mask.unsqueeze(-1).expand_as(joints_pred) * joints_pred
             target = mask.unsqueeze(-1).expand_as(target) * target
             
-            loss = criterion(cls_logits, label, joints_pred, target, points, weights, 20, mask)
+            loss = criterion(cls_logits, label, joints_pred, target, points, mask)
 
             correct_classes = torch.sum(torch.max(cls_logits, 1)[1] == label).item()
             mean_correct_train.append(correct_classes / float(points.size()[0]))

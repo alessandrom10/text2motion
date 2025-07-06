@@ -47,7 +47,7 @@ class PointNetPartSeg(nn.Module):
         l2_points = self.fp3(l2_xyz, l3_xyz, l2_points, l3_points)
         l1_points = self.fp2(l1_xyz, l2_xyz, l1_points, l2_points)
         l0_points = self.fp1(l0_xyz, l1_xyz, torch.cat([l0_xyz,l0_points],1), l1_points)
-        # FC layers
+        
         feat =  F.relu(self.bn1(self.conv1(l0_points)))
         x = self.drop1(feat)
         x = self.conv2(x)
@@ -66,28 +66,13 @@ class get_loss(nn.Module):
     def __init__(self):
         super(get_loss, self).__init__()
 
-    def forward(self, cls_logits, labels, pred, target, xyz, weights, k, mask):
+    def forward(self, cls_logits, labels, pred, target, xyz, mask):
 
         loss_classes = 0.1 * nn.NLLLoss()(cls_logits, labels)
 
         sum_mask = mask.sum() * 3
         loss_joint = torch.sum(torch.abs(pred - target)) / sum_mask
 
-        '''xyz = xyz.transpose(1, 2)
-        diff = xyz.unsqueeze(2) - target.unsqueeze(1)
-        distances = torch.norm(diff, dim=3)
-        topk_vals, topk_idx = torch.topk(-distances, k, dim=1)
-        mask = torch.zeros_like(distances, dtype=torch.float32)
-        mask.scatter_(1, topk_idx, 1.0)
-
-        weights = weights.squeeze(-1).permute(0, 2, 1)
-        selected_weights = weights * mask
-        selected_weights = selected_weights.permute(0, 2, 1)
-        weight_sum = selected_weights.sum(dim=2)
-
-        target_prob = torch.ones_like(weight_sum)
-        loss_prob = 0.1 * nn.MSELoss()(weight_sum, target_prob)'''
-
-        loss = loss_classes + loss_joint #+ loss_prob
+        loss = loss_classes + loss_joint
 
         return loss
