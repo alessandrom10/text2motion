@@ -13,6 +13,17 @@ import matplotlib.pyplot as plt
 warnings.filterwarnings('ignore')
 
 
+def load_datasets(args):
+    train_dataset = TruebonesDataset(npoints=args.npoint, split='train')
+    test_dataset = TruebonesDataset(npoints=args.npoint, split='test')
+    test_dataset.set_seg_classes(train_dataset.seg_classes)
+    test_dataset.set_part_classes(train_dataset.part_classes)
+    test_dataset.set_dict_groups(train_dataset.dict_groups)
+
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=10, drop_last=True)
+    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=10)
+    return train_dataset, test_dataset, train_loader, test_loader
+
 def find_files_with_substring(folder_path, substring):
     for filename in os.listdir(folder_path):
         if substring in filename and ".npz" in filename:
@@ -28,7 +39,7 @@ def pc_normalize(pc):
 
 class TruebonesDataset(Dataset):
 
-    def __init__(self,root = './data/Truebone_Z-OO', npoints=2500, split='train', class_choice=None, normal_channel=False):
+    def __init__(self,root = './data/Truebone_Z-OO', npoints=2500, split='train'):
         self.npoints = npoints
         self.root = root
         self.split = split
