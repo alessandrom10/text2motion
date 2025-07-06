@@ -133,8 +133,8 @@ def main(args):
 
     '''MODEL LOADING'''
     MODEL = importlib.import_module(args.model)
-    shutil.copy("models/pointnet/models/" +args.model+'.py', str(exp_dir))
-    shutil.copy("models/pointnet/models/" +args.model+'_utils.py', str(exp_dir))
+    shutil.copy("models/classifier/models/" +args.model+'.py', str(exp_dir))
+    shutil.copy("models/classifier/models/" +args.model+'_utils.py', str(exp_dir))
 
     classifier = MODEL.PointNetPartSeg(num_classes, seg_classes).cuda()
     criterion = MODEL.get_loss().cuda()
