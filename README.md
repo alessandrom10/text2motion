@@ -1,4 +1,7 @@
 # Text2Motion
+<img src="assets/chicken_roars.gif" width="400"/>
+
+A chicken roars
 
 **Text2Motion** is a deep learning system that translates text descriptions into realistic 3D animations for any given mesh. It automates complex animation workflows with an intelligent, three-stage pipeline:
 
