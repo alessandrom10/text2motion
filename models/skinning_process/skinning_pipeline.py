@@ -1,8 +1,11 @@
 import numpy as np
 import torch
 import networkx as nx
-from SKINNING import SKINNET, skinnet  # Your SKINNET class
-from torch_geometric.data import Data  # Optional, if using PyG for graph data
+import sys
+import os
+import models.SKINNING
+from models.SKINNING import skinnet
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 def build_skeleton_graph(bones_edges):
     """
