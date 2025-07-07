@@ -13,16 +13,6 @@ def build_skeleton_graph(bones_edges):
     G.add_edges_from(bones_edges)
     return G
 
-def exclude_mst_edges(graph):
-    """
-    Compute MST and exclude MST edges from graph edges,
-    returning edges *not* in MST.
-    """
-    mst = nx.minimum_spanning_tree(graph)
-    mst_edges = set(mst.edges())
-    non_mst_edges = [e for e in graph.edges() if e not in mst_edges and (e[1], e[0]) not in mst_edges]
-    return non_mst_edges
-
 def build_mesh_graph(vertex_adjacency):
     """
     vertex_adjacency: list of (v1, v2) edges representing mesh connectivity
@@ -84,17 +74,15 @@ def skinning_pipeline(mesh_vertices, vertex_adjacency, bones_edges, bone_transfo
     use_Dg, use_Lf: flags controlling input features (from skinning.py)
     """
 
-    # Step 1: Build skeleton graph and exclude MST edges
+    # Step 1: Build skeleton graph and compute MST
     skeleton_graph = build_skeleton_graph(bones_edges)
-    non_mst_edges = exclude_mst_edges(skeleton_graph)
-    non_mst_graph = nx.Graph()
-    non_mst_graph.add_edges_from(non_mst_edges)
+    mst_graph = nx.minimum_spanning_tree(skeleton_graph) # Extract MST
 
     # Step 2: Build mesh graph
     mesh_graph = build_mesh_graph(vertex_adjacency)
 
     # Step 3: Convert graphs to edge_index format for GNN
-    tpl_edge_index = graph_to_edge_index(non_mst_graph)   # skeleton graph edges (non-MST)
+    tpl_edge_index = graph_to_edge_index(mst_graph)   # skeleton graph edges (non-MST)
     geo_edge_index = graph_to_edge_index(mesh_graph)      # mesh graph edges
 
     # Step 4: Prepare skin_input feature tensor (dummy example, real input depends on your data)
