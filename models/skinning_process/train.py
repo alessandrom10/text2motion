@@ -100,6 +100,8 @@ def main(args):
     mkdir_p(args.checkpoint)
     if not args.resume:
         if isdir(args.logdir):
+            print("CWD is:", os.getcwd())
+            print("Trying to delete:", os.path.abspath(args.logdir))
             shutil.rmtree(args.logdir)
         mkdir_p(args.logdir)
 
