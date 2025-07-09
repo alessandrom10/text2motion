@@ -81,27 +81,6 @@ The complete training process involves three distinct stages that must be run **
 
 -----
 
-### Generating Animations
-
-Once all three models are trained, you can generate a new animation from a text prompt and a static 3D mesh file.
-
-Use the `generate.py` script with your desired text prompt and the path to your input mesh.
-
-```bash
-python -m scripts.generate \
-  --prompt "A dog is running" \
-  --input_mesh "path/to/your/mesh.obj"
-```
-
-The script will load the trained pipeline, process your mesh and generate the corresponding animation in the folder `output`.
-
-To visualize it, use blender with the following prompt:
-
-   ```bash
-   blender --python scripts/visualization_blender.py --animation output/your_animation_folder
-   ```
------
-
 ## Acknowledgments
 
 * **[Truebones](https://truebones.gumroad.com/)** for providing the excellent and comprehensive Zoo dataset.
