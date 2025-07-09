@@ -8,116 +8,168 @@ import importlib
 import shutil
 import numpy as np
 import models.classifier.provider as provider
-from models.classifier.models.pointnet2 import PointNetPartSeg, JointPredictionLoss
 from pathlib import Path
 from tqdm import tqdm
 from dataset.dataset_pointnet import TruebonesDataset, pc_normalize, load_datasets
 import torch.nn as nn
-from utils.pointnet_utils import setup_directories, setup_logger, plot_point_cloud_with_joints
+from utils.pointnet_utils import setup_directories, setup_logger, \
+    initialize_model, initialize_optimizer, adjust_learning_rate_and_momentum
+from collections import defaultdict
+from utils.pointnet_utils import setup_directories, setup_logger, \
+    initialize_model, initialize_optimizer, adjust_learning_rate_and_momentum
+from collections import defaultdict
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = BASE_DIR
 sys.path.append(os.path.join(ROOT_DIR, 'models'))
 
-def initialize_model(args, num_classes, seg_classes, exp_dir, logger):
-    model = PointNetPartSeg(num_classes, seg_classes).cuda()
-    criterion = JointPredictionLoss().cuda()
 
-    def weights_init(m):
-        if isinstance(m, (nn.Conv2d, nn.Linear)):
-            nn.init.xavier_normal_(m.weight.data)
-            if m.bias is not None:
-                nn.init.constant_(m.bias.data, 0.0)
+def train_one_epoch(model, optimizer, train_loader, criterion, epoch):
 
-    try:
-        checkpoint = torch.load(exp_dir / 'checkpoints/best_model.pth')
-        model.load_state_dict(checkpoint['model_state_dict'])
-        start_epoch = checkpoint['epoch']
-        logger.info('Use pretrain model')
-    except:
-        logger.info('No existing model, starting training from scratch...')
-        model.apply(weights_init)
-        start_epoch = 0
-
-    return model, criterion, start_epoch
-
-def initialize_optimizer(args, model):
-    if args.optimizer == 'Adam':
-        return torch.optim.Adam(model.parameters(), lr=args.learning_rate, betas=(0.9, 0.999), eps=1e-08, weight_decay=args.decay_rate)
-    else:
-        return torch.optim.SGD(model.parameters(), lr=args.learning_rate, momentum=0.9)
-
-def adjust_learning_rate_and_momentum(optimizer, model, epoch, args):
-    lr = max(args.learning_rate * (args.lr_decay ** (epoch // args.step_size)), 1e-5)
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
-    momentum = max(0.1 * (0.5 ** (epoch // args.step_size)), 0.01)
-    for m in model.modules():
-        if isinstance(m, (nn.BatchNorm2d, nn.BatchNorm1d)):
-            m.momentum = momentum
-    return lr, momentum
-
-def train_one_epoch(model, optimizer, train_loader, criterion):
+def train_one_epoch(model, optimizer, train_loader, criterion, epoch):
     model.train()
     mean_correct = []
-    losses = []
-    for points, label, mask, target in tqdm(train_loader, smoothing=0.9):
+    losses_l1 = []
+    losses_skin = []
+
+    for points, label, mask, target, weights_gt, tpl_edge_index, N in tqdm(train_loader, smoothing=0.9):
+    losses_l1 = []
+    losses_skin = []
+
+    for points, label, mask, target, weights_gt, tpl_edge_index, N in tqdm(train_loader, smoothing=0.9):
         optimizer.zero_grad()
-        points = provider.shuffle_points(points)
+
+        # Augmentations
+        points, weights_gt = provider.shuffle_points(points, weights_gt)
+
+        # Augmentations
+        points, weights_gt = provider.shuffle_points(points, weights_gt)
         points_joint = provider.shift_point_cloud(provider.random_scale_point_cloud(np.concatenate((points, target), axis=1)))
         points = torch.Tensor(points_joint[:, :points.shape[1], :])
         target = torch.Tensor(points_joint[:, points.shape[1]:, :])
-        points, label, mask, target = points.cuda().float(), label.cuda().long(), mask.cuda(), target.cuda()
+
+        # Move on gpu
+        points, label, mask, target, weights_gt = points.cuda().float(), label.cuda().long(), mask.cuda(), target.cuda(), weights_gt.cuda()
+
+        # Move on gpu
+        points, label, mask, target, weights_gt = points.cuda().float(), label.cuda().long(), mask.cuda(), target.cuda(), weights_gt.cuda()
         points = points.transpose(2, 1)
 
-        joints_pred, cls_logits = model(points)
+        # Forward pass and loss calculation
+        joints_pred, skin_weights, cls_logits = model(points, tpl_edge_index)
         joints_pred *= mask.unsqueeze(-1).expand_as(joints_pred)
         target *= mask.unsqueeze(-1).expand_as(target)
-
-        loss = criterion(cls_logits, label, joints_pred, target, mask)
-        loss.backward()
-        optimizer.step()
+        loss, all_losses = criterion(cls_logits, label, joints_pred, target, mask, skin_weights, weights_gt)
+        l1_loss = all_losses['joint_loss']
+        skin_loss = all_losses['skin_loss']
+        loss, all_losses = criterion(cls_logits, label, joints_pred, target, mask, skin_weights, weights_gt)
+        l1_loss = all_losses['joint_loss']
+        skin_loss = all_losses['skin_loss']
 
         correct = torch.sum(torch.max(cls_logits, 1)[1] == label).item()
         mean_correct.append(correct / float(points.size()[0]))
+        losses_l1.append(l1_loss)
+        losses_skin.append(skin_loss)
 
-        l1_loss = torch.sum(torch.abs(joints_pred - target)) / (mask.sum() * 3)
-        losses.append(l1_loss.item())
-    return np.mean(mean_correct), np.mean(losses)
+        # Backward pass and optimization
+        loss.backward()
+        optimizer.step()
 
-def evaluate_model(model, test_loader, criterion, epoch, best_loss=None):
+    return np.mean(mean_correct), np.mean(losses_l1), np.mean(losses_skin)
+        losses_l1.append(l1_loss)
+        losses_skin.append(skin_loss)
+
+        # Backward pass and optimization
+        loss.backward()
+        optimizer.step()
+
+    return np.mean(mean_correct), np.mean(losses_l1), np.mean(losses_skin)
+
+def evaluate_model(model, test_loader, criterion, epoch, num_repetitions_eval):
+def evaluate_model(model, test_loader, criterion, epoch, num_repetitions_eval):
     model.eval()
-    mean_correct = []
-    losses_l1 = []
-    losses = []
+
+    all_cls_logits = defaultdict(list)
+    all_joints_preds = defaultdict(list)
+    all_skin_losses = defaultdict(list)
+    
+    ground_truths = {}
+
     with torch.no_grad():
-        for points, label, mask, target in tqdm(test_loader, smoothing=0.9):
-            points = provider.shuffle_points(points)
-            points_joint = provider.shift_point_cloud(provider.random_scale_point_cloud(np.concatenate((points, target), axis=1)))
-            points = torch.Tensor(points_joint[:, :points.shape[1], :])
-            target = torch.Tensor(points_joint[:, points.shape[1]:, :])
-            points, label, mask, target = points.cuda().float(), label.cuda().long(), mask.cuda(), target.cuda()
-            points = points.transpose(2, 1)
-            joints_pred, cls_logits = model(points)
-            joints_pred *= mask.unsqueeze(-1).expand_as(joints_pred)
-            target *= mask.unsqueeze(-1).expand_as(target)
+        for run_idx in range(num_repetitions_eval):
+            print(f"Evaluation run {run_idx + 1}/5")
+            for batch_idx, (points, label, mask, target, weights_gt, tpl_edge_index, N) in enumerate(tqdm(test_loader)):
+                
+                # Augmentations
+                points, weights_gt = provider.shuffle_points(points, weights_gt)
+                points_joint = provider.shift_point_cloud(provider.random_scale_point_cloud(np.concatenate((points, target), axis=1)))
+                points = torch.Tensor(points_joint[:, :points.shape[1], :])
+                target = torch.Tensor(points_joint[:, points.shape[1]:, :])
+                
+                # Move on gpu
+                points, label, mask, target, weights_gt = points.cuda().float(), label.cuda().long(), mask.cuda(), target.cuda(), weights_gt.cuda()
+                points = points.transpose(2, 1)
 
-            correct = torch.sum(torch.max(cls_logits, 1)[1] == label).item()
-            mean_correct.append(correct / float(points.size()[0]))
+                # Forward pass and loss calculation
+                joints_pred, skin_weights, cls_logits = model(points, tpl_edge_index)
+                _, all_losses = criterion(cls_logits, label, joints_pred, target, mask, skin_weights, weights_gt)
+                
+                # Save the results for this run
+                batch_size = points.size(0)
+                for i in range(batch_size):
+                    sample_id = batch_idx * batch_size + i
+                    
+                    all_cls_logits[sample_id].append(cls_logits[i])
+                    all_joints_preds[sample_id].append(joints_pred[i])
+                    all_skin_losses[sample_id].append(all_losses['skin_loss'])
+                    
+                    # Save ground truth only for the first run
+                    if run_idx == 0:
+                        ground_truths[sample_id] = {
+                            'label': label[i],
+                            'target': target[i],
+                            'mask': mask[i]
+                        }
 
-            l1_loss = torch.sum(torch.abs(joints_pred - target)) / (mask.sum() * 3)
-            losses_l1.append(l1_loss.item())
+    # Aggregate results across runs
+    total_correct = 0
+    final_joint_losses = []
+    num_samples = len(ground_truths)
+
+    for i in range(num_samples):
+
+        # Classification: majority vote
+        sample_logits = torch.stack(all_cls_logits[i], dim=0)
+        sample_preds = torch.max(sample_logits, 1)[1]
+        majority_vote, _ = torch.mode(sample_preds, dim=0)
+        if majority_vote == ground_truths[i]['label']:
+            total_correct += 1
             
-            loss = criterion(cls_logits, label, joints_pred, target, mask)
-            losses.append(loss.item())
+        # Joint predictions: average across runs
+        sample_joints = torch.stack(all_joints_preds[i], dim=0)
+        avg_joints_pred = sample_joints.mean(dim=0)
+        
+        gt_target = ground_truths[i]['target']
+        gt_mask = ground_truths[i]['mask']
+        
+        avg_joints_pred *= gt_mask.unsqueeze(-1).expand_as(avg_joints_pred)
+        gt_target *= gt_mask.unsqueeze(-1).expand_as(gt_target)
+        
+        joint_loss = torch.nn.functional.l1_loss(avg_joints_pred, gt_target)
+        final_joint_losses.append(joint_loss.item())
 
-            if epoch > 197:
-                pc = points[0].transpose(0, 1).cpu().numpy()
-                joints = joints_pred[0][mask[0].bool()].cpu().numpy()
-                joints_true = target[0][mask[0].bool()].cpu().numpy()
-                plot_point_cloud_with_joints(pc, joints, joints_true)
+    # Skin weights: loss average across runs
+    flat_skin_losses = [loss for losses in all_skin_losses.values() for loss in losses]
 
-    return np.mean(mean_correct), np.mean(losses_l1), np.mean(losses)
+    final_accuracy = total_correct / num_samples
+    final_loss_l1 = np.mean(final_joint_losses)
+    final_loss_skin = np.mean(flat_skin_losses)
+
+    final_total_loss = final_loss_skin 
+    
+    return final_accuracy, final_loss_l1, final_loss_skin, final_total_loss
+
+
 
 def train_loop(args):
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
@@ -137,18 +189,36 @@ def train_loop(args):
         lr, momentum = adjust_learning_rate_and_momentum(optimizer, model, epoch, args)
         logger.info(f'Epoch {epoch + 1}: learning rate={lr:.6f}, BN momentum={momentum:.6f}')
 
-        acc_train, lossl1_train = train_one_epoch(model, optimizer, train_loader, criterion)
-        acc_test, lossl1_test, all_loss = evaluate_model(model, test_loader, criterion, epoch, best_loss)
+        acc_train, lossl1_train, loss_skin_train = train_one_epoch(model, optimizer, train_loader, criterion, epoch)
+        logger.info(f'Train L1 Loss: {lossl1_train:.6f}, Accuracy: {acc_train:.6f}, Skin Loss: {loss_skin_train:.6f}')
 
-        if all_loss < best_loss:
-            best_loss = all_loss
-            torch.save({
-                'epoch': epoch + 1,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'loss': all_loss,
-            }, exp_dir / 'checkpoints/best_model.pth')
-            logger.info(f'Saving best model at epoch {epoch + 1} with loss {all_loss:.6f}')
+        if epoch % args.eval_freq == 0 or epoch == args.epoch - 1:
+            acc_test, lossl1_test, loss_skin_test, all_loss = evaluate_model(model, test_loader, criterion, epoch, args.num_repetitions_eval)
+        acc_train, lossl1_train, loss_skin_train = train_one_epoch(model, optimizer, train_loader, criterion, epoch)
+        logger.info(f'Train L1 Loss: {lossl1_train:.6f}, Accuracy: {acc_train:.6f}, Skin Loss: {loss_skin_train:.6f}')
 
-        logger.info(f'Train L1 Loss: {lossl1_train:.6f}, Accuracy: {acc_train:.6f}')
-        logger.info(f'Test L1 Loss: {lossl1_test:.6f}, Accuracy: {acc_test:.6f}')
+        if epoch % args.eval_freq == 0 or epoch == args.epoch - 1:
+            acc_test, lossl1_test, loss_skin_test, all_loss = evaluate_model(model, test_loader, criterion, epoch, args.num_repetitions_eval)
+
+            if all_loss < best_loss:
+                best_loss = all_loss
+                torch.save({
+                    'epoch': epoch + 1,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'loss': all_loss,
+                }, exp_dir / 'checkpoints/best_model.pth')
+                logger.info(f'Saving best model at epoch {epoch + 1} with loss {all_loss:.6f}')
+            if all_loss < best_loss:
+                best_loss = all_loss
+                torch.save({
+                    'epoch': epoch + 1,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'loss': all_loss,
+                }, exp_dir / 'checkpoints/best_model.pth')
+                logger.info(f'Saving best model at epoch {epoch + 1} with loss {all_loss:.6f}')
+
+            logger.info(f'Test L1 Loss: {lossl1_test:.6f}, Accuracy: {acc_test:.6f}, Skin Loss: {loss_skin_test:.6f}')
+
+            logger.info(f'Test L1 Loss: {lossl1_test:.6f}, Accuracy: {acc_test:.6f}, Skin Loss: {loss_skin_test:.6f}')

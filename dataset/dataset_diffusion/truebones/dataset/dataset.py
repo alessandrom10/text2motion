@@ -48,7 +48,7 @@ class MotionDataset(data.Dataset):
         self.csv_file = pjoin(opt.data_root, 'truebones.csv')
         self.csv_df = pd.read_csv(self.csv_file)
 
-        self.embeddings_file = pjoin(opt.data_root, 'truebones_embeddings.pt')
+        self.embeddings_file = pjoin(opt.data_root, 'truebones_embeddings_small.pt')
         self.embeddings_sbert = torch.load(self.embeddings_file)
         data_dict = {}
         all_object_types = self.cond_dict.keys()

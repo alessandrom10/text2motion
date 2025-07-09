@@ -13,6 +13,8 @@ def parse_args():
     parser.add_argument('--npoint', type=int, default=2048, help='point Number')
     parser.add_argument('--step_size', type=int, default=20, help='decay step for lr decay')
     parser.add_argument('--lr_decay', type=float, default=0.5, help='decay rate for lr decay')
+    parser.add_argument('--eval_freq', type=int, default=10, help='frequency of evaluation')
+    parser.add_argument('--num_repetitions_eval', type=int, default=5, help='number of repetitions for evaluation')
 
     return parser.parse_args()
 

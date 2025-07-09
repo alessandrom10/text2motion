@@ -32,17 +32,18 @@ def shuffle_data(data, labels):
     np.random.shuffle(idx)
     return data[idx, ...], labels[idx], idx
 
-def shuffle_points(batch_data):
+def shuffle_points(batch_data, batch_weights):
     """ Shuffle orders of points in each point cloud -- changes FPS behavior.
         Use the same shuffling idx for the entire batch.
         Input:
             BxNxC array
+            BXNxC array
         Output:
             BxNxC array
     """
     idx = np.arange(batch_data.shape[1])
     np.random.shuffle(idx)
-    return batch_data[:,idx,:]
+    return batch_data[:,idx,:], batch_weights[:,idx,:]
 
 import numpy as np
 
