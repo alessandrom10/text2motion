@@ -4,6 +4,31 @@ import torch.nn.functional as F
 from time import time
 import numpy as np
 
+def add_nearest_joint(xyz, feat, joints_pos, mask, nearest_k):
+    xyz = xyz.permute(0, 2, 1).contiguous()
+    joints_pos = joints_pos.clone()
+
+    xyz_exp = xyz[:, :, None, :]         # [B, N, 1, 3]
+    joints_exp = joints_pos[:, None, :, :]  # [B, 1, J, 3]
+    distances = xyz_exp - joints_exp     # [B, N, J, 3]
+    distances = distances.norm(dim=-1)   # [B, N, J]
+
+    B, N, J = distances.shape
+
+    # Broadcasting the mask and take the K closest joints
+    mask_exp = mask[:, None, :].to(distances.device)
+    masked_distances = distances.clone().masked_fill(~mask_exp, float('inf'))
+    _, topk_indices = torch.topk(masked_distances, nearest_k, dim=-1, largest=False)            # [B, N, K]
+
+    # add the nearest joints to the feature vector
+    topk_indices_exp = topk_indices.unsqueeze(-1).expand(-1, -1, -1, 3)                         # [B, N, K, 3]
+    joints_pos_closest = joints_pos.unsqueeze(1).expand(-1, N, -1, -1)                          # [B, N, J, 3]
+    topk_joint_pos = torch.gather(joints_pos_closest, 2, topk_indices_exp)                      # [B, N, K, 3]
+    topk_joint_pos_flat = topk_joint_pos.reshape(B, N, -1)                                      # [B, N, K*3]
+    feat = torch.cat([feat, topk_joint_pos_flat], dim=2)                                        # [B, N, C_feat + K*3]
+
+    return feat
+
 def timeit(tag, t):
     print("{}: {}s".format(tag, time() - t))
     return time()

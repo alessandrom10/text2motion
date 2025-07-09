@@ -47,9 +47,9 @@ class AnyTop(nn.Module):
         self.skip_t5=kargs.get('skip_t5', False)
         self.value_emb=kargs.get('value_emb', False)
         
-        _layers = [nn.Linear(768, self.latent_dim)]
-        for _ in range(2):
-            _layers += [nn.SiLU(), nn.Linear(self.latent_dim, self.latent_dim)]
+        _layers = [
+            nn.Linear(384, self.latent_dim)
+        ]
         self.linear_embed_text = nn.Sequential(*_layers)
 
 

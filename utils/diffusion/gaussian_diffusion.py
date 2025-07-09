@@ -191,6 +191,10 @@ class GaussianDiffusion:
         # assuming temp_mask.shape == bs, 1, 1, seqlen
         # assuming spat_mask.shape == bs, 1, 1, max_joints
 
+        # skip the rotation part of the vector
+        a = torch.cat([a[:, :, :3, :], a[:, :, 9:, :]], dim=2)
+        b = torch.cat([b[:, :, :3, :], b[:, :, 9:, :]], dim=2)
+
         loss = self.l2_loss(a, b)
         temp_masked_loss = loss * temp_mask.float()
         spat_temp_masked_loss = (temp_masked_loss * spat_mask.float().transpose(1,3))

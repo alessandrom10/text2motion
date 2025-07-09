@@ -8,8 +8,60 @@ from torch.utils.data import Dataset
 import trimesh
 from bvh import Bvh
 import matplotlib.pyplot as plt
+from torch_geometric.utils import add_self_loops
+import torch.nn.functional as F
+
 
 warnings.filterwarnings("ignore")
+def hierarchy_bvh(percorso_bvh):
+    if not os.path.exists(percorso_bvh):
+        print(f"Error: File does not exists '{percorso_bvh}'")
+        return []
+
+    hierarchy_pairs = []
+    parent_stack = []
+
+    dict_bone_names = {}
+    last_bone_name = 0
+
+    try:
+        with open(percorso_bvh, 'r') as f:
+            for line in f:
+                parts = line.strip().split()
+                if not parts:
+                    continue
+
+                keyword = parts[0].upper()
+
+                if keyword in ["ROOT", "JOINT"]:
+                    bone_name = parts[1]
+                    
+                    if parent_stack:
+                        parent_name = parent_stack[-1]
+                        if parent_name not in dict_bone_names:
+                            dict_bone_names[parent_name] = last_bone_name
+                            last_bone_name += 1
+                        if bone_name not in dict_bone_names:
+                            dict_bone_names[bone_name] = last_bone_name
+                            last_bone_name += 1
+                        hierarchy_pairs.append([dict_bone_names[parent_name], dict_bone_names[bone_name]])
+                    
+                    parent_stack.append(bone_name)
+
+                elif keyword == "END":
+                    parent_stack.append("EndSite_Placeholder")
+
+                elif keyword == "}":
+                    if parent_stack:
+                        parent_stack.pop()
+
+    except Exception as e:
+        print(f"Error: {e}")
+        return []
+
+    #convert hierarchy_pairs to torch tensor
+    hierarchy_pairs = torch.tensor(hierarchy_pairs, dtype=torch.long)
+    return hierarchy_pairs.reshape(2, -1).contiguous()
 
 def load_datasets(args):
     train_dataset = TruebonesDataset(npoints=args.npoint, split='train')
@@ -54,7 +106,7 @@ class TruebonesDataset(Dataset):
                 'Comodoa': 65, 'Pirrana': 22, 'Crow': 29, 'Spider': 71, 'Buzzard': 62,
                 'Pigeon': 9, 'Hippopotamus': 41, 'Turtle': 50, 'Cricket': 54, 'Dog-2': 131,
                 'Leapord': 48, 'Rhino': 44, 'Rat': 18, 'Roach': 46, 'Gazelle': 42
-            }.items()
+            }.items() if v < 50 and v > 20
         }
 
         self.df = pd.read_csv(os.path.join(root, 'TrueboneZ-OO.csv')).dropna()
@@ -118,6 +170,7 @@ class TruebonesDataset(Dataset):
         with open(os.path.join(self.root, group, row['File'].strip())) as f:
             _ = Bvh(f.read())
 
+        skin_data = np.load(os.path.join(self.root, group, 'skin_data.npz'), allow_pickle=True)
         npz_file = find_files_with_substring(os.path.join(self.root, group), anim_id)
         archive = np.load(os.path.join(self.root, group, npz_file))
 
@@ -129,10 +182,12 @@ class TruebonesDataset(Dataset):
 
         verts = archive[verts_key]
         joints = archive[joints_key]
+        weights = skin_data['weights']
 
         replace = verts.shape[0] < self.npoints
         idx = np.random.choice(verts.shape[0], self.npoints, replace=replace)
         verts = verts[idx]
+        weights = weights[idx]
 
         points = np.concatenate((verts, joints), axis=0)
         points = pc_normalize(points)
@@ -147,7 +202,18 @@ class TruebonesDataset(Dataset):
         final_joints = torch.zeros(self.get_num_part(), 3)
         final_joints[joint_indices] = torch.tensor(joints, dtype=torch.float32)
 
-        return verts, group_id, mask, final_joints
+        final_weights = torch.zeros(self.npoints, self.get_num_part(), dtype=torch.float32)
+        final_weights[:, joint_indices] = torch.tensor(weights, dtype=torch.float32)
+
+        joint_hierarchy = hierarchy_bvh(os.path.join(self.root, group, row["File"].strip()))
+        tpl_edge_index, _ = add_self_loops(torch.tensor(joint_hierarchy).long(), num_nodes=len(points))
+        N = tpl_edge_index.shape[1]
+        if N < 2300:
+            padding_needed = 2300 - N
+            pad_tuple = (0, padding_needed, 0, 0)
+            tpl_edge_index = F.pad(tpl_edge_index, pad_tuple, "constant", 0)
+
+        return verts, group_id, mask, final_joints, final_weights, tpl_edge_index, N
 
     def __len__(self):
         return len(self.df)

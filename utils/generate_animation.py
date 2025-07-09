@@ -10,15 +10,15 @@ import torch
 from utils.parser_util import generate_args
 from utils.model_util import create_model_and_diffusion_general_skeleton, load_model
 from utils import dist_util
-from data_loaders.truebones.truebones_utils.plot_script import plot_general_skeleton_3d_motion
-from data_loaders.tensors import truebones_batch_collate
-from data_loaders.truebones.truebones_utils.motion_process import recover_from_bvh_ric_np, recover_from_bvh_rot_np
-from data_loaders.truebones.data.dataset import create_temporal_mask_for_window
+from dataset.dataset_diffusion.truebones.truebones_utils.plot_script import plot_general_skeleton_3d_motion
+from dataset.dataset_diffusion.tensors import truebones_batch_collate
+from dataset.dataset_diffusion.truebones.truebones_utils.motion_process import recover_from_bvh_ric_np, recover_from_bvh_rot_np
+from dataset.dataset_diffusion.truebones.dataset.dataset import create_temporal_mask_for_window
 from os.path import join as pjoin
-from model.conditioners import T5Conditioner
+from models.diffusion.models.conditioners import T5Conditioner
 import BVH
 from InverseKinematics import animation_from_positions
-from data_loaders.truebones.truebones_utils.get_opt import get_opt
+from dataset.dataset_diffusion.truebones.truebones_utils.get_opt import get_opt
 from sentence_transformers import SentenceTransformer
 
 
@@ -62,7 +62,7 @@ def main(args = None, cond_dict = None):
     model.to(dist_util.dev())
     model.eval()  # disable random masking
 
-    texts = ["Tyranno is running"]
+    texts = ["run"]
     sbert = SentenceTransformer("all-mpnet-base-v2")
     embeddings = sbert.encode(texts, convert_to_tensor=True)
 

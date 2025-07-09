@@ -31,10 +31,9 @@ Follow these instructions to get the project up and running on your local machin
    ```
    text2motion/
    ├── data/
-   │   └── Truebones_Zoo_dataset/
+   │   └── Truebone_Z-OO/
    │       └── ... (dataset files)
    ├── train_classifier.py
-   ├── train_skinning.py
    ├── train_diffusion.py
    └── ...
    ```
@@ -66,18 +65,11 @@ Follow these instructions to get the project up and running on your local machin
 
 The complete training process involves three distinct stages that must be run **in order**. Each stage trains a separate model that is essential for the final animation pipeline.
 
-1.  **Train the Classifier**
-    This model learns to analyze a 3D mesh and predict its skeletal structure (armature) in the correct positions.
+1.  **Train the Classifier and skinning model**
+    This model learns to analyze a 3D mesh and predict its skeletal structure (armature) in the correct positions with a weight for each vertex.
 
     ```bash
-    python train_classifier.py
-    ```
-
-2.  **Train the Skinning Model**
-    This model learns how to properly bind the mesh to the predicted armature, enabling realistic deformations.
-
-    ```bash
-    python train_skinning.py
+    python train_classifier_skinning.py
     ```
 
 3.  **Train the Diffusion Model**
