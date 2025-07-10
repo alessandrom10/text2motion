@@ -46,26 +46,6 @@ def normalize_skin_weights(weights):
     normalized = weights / weights_sum
     return normalized
 
-def linear_blend_skinning(vertices, skin_weights, bone_transforms):
-    """
-    vertices: Tensor [num_vertices, 3]
-    skin_weights: Tensor [num_vertices, num_bones]
-    bone_transforms: Tensor [num_bones, 4, 4] (homogeneous transforms)
-    
-    Returns deformed_vertices: Tensor [num_vertices, 3]
-    """
-    num_vertices, num_bones = skin_weights.shape
-    vertices_h = torch.cat([vertices, torch.ones(num_vertices, 1)], dim=1)  # to homogeneous [x,y,z,1]
-    deformed = torch.zeros_like(vertices_h)
-
-    for b in range(num_bones):
-        T = bone_transforms[b]  # [4,4]
-        w = skin_weights[:, b].unsqueeze(1)  # [num_vertices,1]
-        transformed = (vertices_h @ T.T)  # [num_vertices, 4]
-        deformed += w * transformed
-
-    return deformed[:, :3]  # drop homogeneous coord
-
 # Main skinning pipeline
 
 def skinning_pipeline(mesh_vertices, vertex_adjacency, bones_edges, bone_transforms, nearest_bone, use_Dg, use_Lf):
@@ -113,8 +93,5 @@ def skinning_pipeline(mesh_vertices, vertex_adjacency, bones_edges, bone_transfo
 
     # Step 7: Normalize skin weights
     skin_weights = normalize_skin_weights(skin_weights_raw)
-
-    # Step 8: Apply linear blend skinning
-    deformed_vertices = linear_blend_skinning(mesh_vertices, skin_weights, bone_transforms)
 
     return deformed_vertices, skin_weights
