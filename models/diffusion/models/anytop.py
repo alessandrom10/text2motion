@@ -47,11 +47,7 @@ class AnyTop(nn.Module):
         self.skip_t5=kargs.get('skip_t5', False)
         self.value_emb=kargs.get('value_emb', False)
         
-        _layers = [
-            nn.Linear(384, self.latent_dim)
-        ]
-        self.linear_embed_text = nn.Sequential(*_layers)
-
+        self.sbert_enhancer = nn.Linear(384, self.latent_dim)
 
         self.input_process = InputProcess(self.input_feats, self.root_input_feats, self.latent_dim, t5_out_dim, skip_t5=self.skip_t5)
 
@@ -80,7 +76,10 @@ class AnyTop(nn.Module):
         
         bs, njoints, nfeats, nframes = x.shape
         timesteps_emb = create_sin_embedding(timesteps.view(1, -1, 1), self.latent_dim)[0]
-        timesteps_emb += self.linear_embed_text(text_embed) if text_embed is not None else 0.0
+        if text_embed is not None:
+            enhanced_text_embed = self.sbert_enhancer(text_embed)
+            timesteps_emb += enhanced_text_embed
+            if y is not None: y['enhanced_text_embed'] = enhanced_text_embed
 
         x = self.input_process(x, tpos_first_frame, y['joints_names_embs'], y['crop_start_ind']) # applies linear layer on each frame to convert it to latent dim
         spatial_mask = 1.0 - joints_mask[:, 0, 0, 1:, 1:]

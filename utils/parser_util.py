@@ -138,6 +138,8 @@ def add_training_options(parser):
                        help="If True, will use EMA model averaging.")
     group.add_argument("--balanced", action='store_true',
                        help="Use balancing sampler for fairness between topologies")
+    group.add_argument("--sbert_loss_weight", default=0.1, type=float,
+                       help="Weight of the SBERT loss in the training loop")
 
 def add_sampling_options(parser):
     group = parser.add_argument_group('sampling')

@@ -1,3 +1,5 @@
+import re
+from sentence_transformers import SentenceTransformer
 import torch
 from torch.utils import data
 from torch.utils.data.sampler import WeightedRandomSampler
@@ -10,6 +12,7 @@ from dataset.dataset_diffusion.truebones.truebones_utils.get_opt import get_opt
 from dataset.dataset_diffusion.truebones.truebones_utils.motion_process import remove_joints_augmentation, add_joint_augmentation
 from models.diffusion.models.conditioners import T5Conditioner
 import pandas as pd
+from sklearn.metrics.pairwise import cosine_similarity
 
 
 def collate_fn(batch):
@@ -34,6 +37,10 @@ def create_temporal_mask_for_window(window, max_len):
     for i in range(max_len+1):
         mask[i, max(0, i - margin):min(max_len + 1, i + margin + 2)] = 1
     return mask
+
+""" Get verb from filename, used for text motion matching model"""
+def get_verb_from_filename(filename: str) -> str:
+    return re.sub(r'\d+$|\.BVH$|^__', '', filename, flags=re.IGNORECASE).upper()
 
 '''For use of training text motion matching model, and evaluations'''
 class MotionDataset(data.Dataset):
@@ -94,7 +101,8 @@ class MotionDataset(data.Dataset):
                                         'offsets': offsets,
                                         'joints_names_embs': joints_names_embs,
                                         'kinematic_chains': kinematic_chains,
-                                        'embed_text': embed_text
+                                        'embed_text': embed_text,
+                                        'real_text': text
                                        }
                                        
                     new_name_list.append(name)
@@ -174,7 +182,7 @@ class MotionDataset(data.Dataset):
         
 
 
-        return motion, m_length, parents, tpos_first_frame, offsets, self.temporal_mask_template, joints_graph_dist, joints_relations, object_type, joints_names_embs, ind, mean, std, self.opt.max_joints, embed_text
+        return motion, m_length, parents, tpos_first_frame, offsets, self.temporal_mask_template, joints_graph_dist, joints_relations, object_type, joints_names_embs, ind, mean, std, self.opt.max_joints, embed_text, data['real_text'] if 'real_text' in data else None
 
 class TruebonesSampler(WeightedRandomSampler):
     def __init__(self, data_source):
@@ -221,3 +229,51 @@ class Truebones(data.Dataset):
 
     def __len__(self):
         return self.motion_dataset.__len__()
+    
+class PairedMotionDataset(MotionDataset):
+    def __init__(self, opt, cond_dict, temporal_window, t5_name, balanced, similarity_threshold: float = 0.5):
+        super().__init__(opt, cond_dict, temporal_window, t5_name, balanced)
+        self.similarity_threshold = similarity_threshold
+        self.metadata = self.csv_df.copy()
+        self.metadata['verb'] = self.metadata['File'].apply(get_verb_from_filename)
+
+        self.unique_verbs = self.metadata['verb'].unique().tolist()
+        self.verb_to_indices = self.metadata.groupby('verb').groups
+
+        self.idx_to_verb = {
+            i: get_verb_from_filename(file) for i, file in enumerate(self.name_list)
+        }
+
+        self.positive_candidates = self._build_positive_candidate_map(similarity_threshold)
+
+    def _build_positive_candidate_map(self, threshold) -> dict:
+        """Compute SBERT similarity among verbs and cache positive samples."""
+        sbert = SentenceTransformer('all-MiniLM-L6-v2')
+        verb_embeds = sbert.encode(self.unique_verbs, convert_to_numpy=True)
+        sim_matrix = cosine_similarity(verb_embeds)
+
+        candidates = {}
+        for i, verb in enumerate(self.unique_verbs):
+            similar_verbs = [
+                self.unique_verbs[j]
+                for j, sim in enumerate(sim_matrix[i]) if sim > threshold
+            ]
+            indices = [
+                idx for v in similar_verbs for idx in self.verb_to_indices.get(v, [])
+            ]
+            candidates[verb] = indices
+        return candidates
+
+    def __getitem__(self, index):
+        anchor_data = super().__getitem__(index)
+        anchor_verb = self.idx_to_verb[index]
+        pos_indices = []
+        if anchor_verb:
+            pos_indices = [i for i in self.positive_candidates.get(anchor_verb, []) if i != index and i < len(self)]
+        pos_index = random.choice(pos_indices) if pos_indices else index
+        positive_data = super().__getitem__(pos_index)
+
+        motion, m_length, parents, tpos_first_frame, offsets, self.temporal_mask_template, joints_graph_dist, joints_relations, object_type, joints_names_embs, ind, mean, std, self.opt.max_joints, embed_text, real_text = anchor_data
+        _, _, _, _, _, _, _, _, _, _, _, _, _, _, embed_text_pos, _ = positive_data
+
+        return motion, m_length, parents, tpos_first_frame, offsets, self.temporal_mask_template, joints_graph_dist, joints_relations, object_type, joints_names_embs, ind, mean, std, self.opt.max_joints, embed_text, real_text, embed_text_pos
