@@ -55,7 +55,7 @@
 
 % The \icmltitle you define below is probably too long as a header.
 % Therefore, a short form for the running title is supplied here:
-\icmltitlerunning{Text2Notion}
+\icmltitlerunning{Text2Motion}
 
 \begin{document}
 
@@ -136,6 +136,106 @@ This richness of content creates three principal difficulties.  First, limb coun
 We proceed under the initial assumptions that (i) the cleaned dataset is free of corrupted or misaligned frames, (ii) the catalogue of armatures addressed by the classifier is sufficient to cover all meshes encountered, and (iii) the chosen text-embedding pipeline supplies adequate semantic guidance for the diffusion model without requiring additional labels.
 
 \section{Method}
+
+\subsection{Point\-Net\texttt{++} for Topology–Invariant Rigging and Skinning}
+\label{subsec:pointnetpp}
+
+We employ Point\-Net\texttt{++} as backbone to derive three predictions from a raw point cloud:  
+(i) the armature class, (ii) the 3-D coordinates of each joint of the predicted armature, and (iii) the per-vertex skinning weights.
+\paragraph{Input.}
+Given a watertight mesh~$\mathcal{M}$ we sample $N = 2{,}048$ surface points by farthest-point sampling (FPS).  
+Let $\{\mathbf v_i\}_{i=1}^{N}\!\subset\!\mathbb{R}^{3}$ be the coordinates (unit-sphere normalised) and
+$\{\mathbf n_i\}_{i=1}^{N}\!\subset\!\mathbb{R}^{3}$ the corresponding normals; the network therefore ingests $6$ channels per point.  
+Two auxiliary tensors are passed for efficiency-they could in principle be inferred after classification:
+
+\begin{itemize}
+  \item $\texttt{tpl\_edge\_index}\in\mathbb{N}^{2\times E}$ – fixed edge list of the template skeleton graph;
+  \item $\texttt{mask}\in\{0,1\}^{K}$ – Boolean mask selecting the $D\!\le\!K$ joints present in the predicted armature.
+\end{itemize}
+
+Providing them at inference time avoids two extra network calls and halves latency, at the cost of breaking strict end-to-end purity.
+
+\paragraph{Encoder (Set Abstraction).}
+Three Point\-Net\texttt{++} SA layers extract a global descriptor and intermediate features
+(Table~\ref{tab:sa}).  Skip connections will be reused in the decoder.
+
+\begin{table}[h]
+  \centering\small
+  \caption{Set-abstraction layers}
+  \label{tab:sa}
+  \begin{tabular}{@{}ccccc@{}}
+    \toprule
+    Layer & Centroids & Radius & MLP channels & Output dim.\\
+    \midrule
+    SA1 & $512$ & $0.2$ & $[64,64,128]$   & $128$\\
+    SA2 & $128$ & $0.4$ & $[128,128,256]$ & $256$\\
+    SA3 & $1$ (global) & --- & $[256,512,1024]$ & $1{,}024$\\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\paragraph{Decoder (Feature Propagation).}
+FP3, FP2 and FP1 modules propagate features back to the original resolution, yielding per-point descriptors
+$\mathbf h_i\in\mathbb{R}^{128}$.
+
+\paragraph{Branch~1 – Armature classification.}
+A global max-pool over $\{\mathbf h_i\}$ followed by \textsc{mlp}$(1024,512,256,C)$ outputs logits
+$\mathbf c\in\mathbb{R}^{C}$.
+
+\paragraph{Branch~2 – Joint and skinning prediction.}
+\begin{itemize}
+  \item \emph{Joint coordinates.}  
+        \textsc{mlp}$(128,K)$ produces scores~$z_{ik}$.  
+        The point-wise softmax
+        $\sigma_{ik}=\exp(z_{ik})/\sum_{j=1}^{N}\exp(z_{jk})$ acts as attention weight,  
+        and the $k$-th joint is regressed as
+        $\hat{\mathbf J}_k = \sum_{i=1}^{N}\sigma_{ik}\,\mathbf v_i$.
+  \item \emph{Skinning weights.}  
+        Each $\mathbf h_i$ is compressed by \textsc{mlp}$(128,64,32,16)$ and concatenated with
+        $(x_i,y_i,z_i)$ plus the coordinates of its $m=5$ nearest predicted joints.
+        The resulting $34$-dimensional vector is fed to a Graph Convolution Unit (GCU) operating on
+        \texttt{tpl\_edge\_index}.  
+        Global pooling and \textsc{mlp}$(1536,1024,512,K)$ yield logits $w_{ik}$,  
+        turned into probabilities via a vertex-wise softmax.
+\end{itemize}
+
+\paragraph{Loss.}
+We minimise
+\[
+\mathcal{L}= \alpha\,\mathcal{L}_{\text{cls}}
+           + \beta\,\mathcal{L}_{\text{joint}}
+           + \gamma\,\mathcal{L}_{\text{skin}},
+\quad (\alpha,\beta,\gamma)=(0.1,1,0.1),
+\]
+where $\mathcal{L}_{\text{cls}}$ is cross-entropy on $\mathbf c$,
+$\mathcal{L}_{\text{joint}}=\lVert\hat{\mathbf J}-\mathbf J^\ast\rVert_{1}$,
+and $\mathcal{L}_{\text{skin}}$ is cross-entropy on masked joints.
+
+\paragraph{Variance reduction at test time.}
+We run $T=8$ independent FPS samplings;  
+classes are decided by majority vote, while joint positions and skin weights are averaged over the $T$ normalised outputs.
+
+\subsection{Rigging Process}
+
+Prior to the skinning stage, we perform rigging to determine the placement of joints on the input mesh. In our pipeline, this process assumes access to a predefined skeleton structure that has been selected based on the mesh class (identified in the previous step). This classification step ensures structural consistency and compatibility between the mesh and the rigging template.
+
+Given the mesh and the selected skeleton, the rigging module is tasked with predicting the 3D positions of the skeleton joints within the mesh itself. In order to perform this operation, we adopt a modified version of PointNet(CITATION NEEDED), tailored for joint localization, in fact the final layers of the original PointNet architecture are replaced to output the 3D coordinates of the joints rather than class probabilities.
+
+In each run of the network, 2048 vertices are randomly sampled from the surface of the mesh and used as input to the modified PointNet. The network then predicts the joint positions based on this subset. To reduce the effect of sampling noise and improve prediction stability, we decided to repeat this sampling-and-prediction process multiple times. In our implementation, we perform 5 of such repetitions and compute the final joint positions as the average of the individual predictions, nevertheless empirically, we observed that increasing the number of repetitions further improves robustness by attenuating outlier predictions caused by uneven sampling, but increases the time required by the computation.
+
+This joint prediction strategy enables the rigging module to effectively infer anatomically plausible joint placements, even in the presence of noisy or irregular mesh geometries, and lays the foundation for our subsequent skinning stage.
+
+\subsection{Skinning processs}
+
+For the skinning stage of our pipeline, we adopt the strategy introduced in the RigNet architecture\cite{xu2020rignet}, which enables automatic rigging of 3D character meshes through a learning-based weight assignment. Given a 3D character mesh and a corresponding articulated skeleton, the objective of this process is to compute smooth skinning weights that govern how each vertex will be influenced by each underlying bone during a deformation.
+
+The input to such skinning module includes the 3D coordinates of the mesh vertices and a set of bone-related features for the nearest $k$ bones per vertex. These features encode both geometric and topological relationships between the vertex and the bones, like relative distances, bone orientations, and positional encodings along the kinematic tree.
+
+The network outputs a soft assignment of each vertex to each skeleton joint in the form of skinning weights, ensuring that the weights for each vertex sum to 1 and are non-negative.
+
+Importantly, the skinning process relies solely on the \textit{minimum spanning tree} (MST) of the initial skeleton graph, as this structure captures the essential hierarchical relationships necessary for defining the skinning behavior, and avoids the presence of loops, which wouldn't be compatible with our tree-based skeleton representation.
+
+This learned skinning mechanism has been shown to be able to generalize well across diverse character topologies and ensures a consistent deformation even in complex poses, making it a robust choice for our broader rigging and animation framework.
 
 \section{Electronic Submission}
 \label{submission}
@@ -631,7 +731,7 @@ paper is later flagged for ethics review.
 % references without citing it in the main text, use \nocite
 \nocite{langley00}
 
-\bibliography{example_paper}
+\bibliography{paper}
 \bibliographystyle{icml2025}
 
 
