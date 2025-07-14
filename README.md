@@ -1,7 +1,7 @@
 # Text2Motion
-<img src="assets/chicken_roars.gif" width="400"/>
+<img src="assets/tyranno_attacks.gif" width="400"/>
 
-A chicken roars
+A tyrannosaurus attacks
 
 **Text2Motion** is a deep learning system that translates text descriptions into realistic 3D animations for any given mesh. It automates complex animation workflows with an intelligent, three-stage pipeline:
 
@@ -19,9 +19,12 @@ Follow these instructions to get the project up and running on your local machin
 
 1. **Setup environment**
 
+    To setup the environment, run the following code:
+
     ```bash
       conda env create -f environment.yaml
       conda activate text2motion
+      pip install git+https://github.com/inbar-2344/Motion.git
     ```
 2. **Download the dataset**
 
@@ -33,9 +36,12 @@ Follow these instructions to get the project up and running on your local machin
    ├── data/
    │   └── Truebone_Z-OO/
    │       └── ... (dataset files)
-   ├── train_classifier.py
+   ├── dataset/
+   ├── models/
+   ├── scripts/
+   ├── utils/
+   ├── train_classifier_skinning.py
    ├── train_diffusion.py
-   └── ...
    ```
 
 3. **Preprocess the dataset**
@@ -63,20 +69,20 @@ Follow these instructions to get the project up and running on your local machin
 
 ### Training the Models
 
-The complete training process involves three distinct stages that must be run **in order**. Each stage trains a separate model that is essential for the final animation pipeline.
+The complete training process involves two distinct stages that must be run **in order**. Each stage trains a separate model that is essential for the final animation pipeline.
 
 1.  **Train the Classifier and skinning model**
     This model learns to analyze a 3D mesh and predict its skeletal structure (armature) in the correct positions with a weight for each vertex.
 
     ```bash
-    python train_classifier_skinning.py
+    python -m train_classifier_skinning
     ```
 
 3.  **Train the Diffusion Model**
-    This model learns to generate the actual motion sequence from a text prompt, which is then applied to the skinned model.
+    This model learns to generate the actual motion sequence from a text prompt, which is then applied to the skinned model. See the file `utils/parser_util.py`
 
     ```bash
-    python train_diffusion.py
+    python -m train_diffusion --model_prefix NAME_MODEL --objects_subset bipeds --lambda_geo 1.0 --overwrite --balanced
     ```
 
 -----
