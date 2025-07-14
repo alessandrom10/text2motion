@@ -52,7 +52,7 @@ class GCU(torch.nn.Module):
                                       nn=MLP([in_channels * 2, out_channels // 2, out_channels // 2]), aggr=aggr)
         self.mlp = MLP([out_channels // 2, out_channels])
 
-    def forward(self, x, tpl_edge_index, geo_edge_index):
+    def forward(self, x, tpl_edge_index):
         x_tpl = self.edge_conv_tpl(x, tpl_edge_index)
         x_out = self.mlp(x_tpl)
         return x_out

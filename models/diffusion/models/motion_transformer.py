@@ -180,7 +180,10 @@ class GraphMotionDecoderLayer(nn.TransformerDecoderLayer):
         self.heads = nhead
         self.spatial_attn = GraphMultiHeadAttention(d_model = d_model, nheads = nhead, dropout=dropout)
         self.temporal_attn = MultiheadAttention(self.d_model, nhead, dropout=dropout) 
+        self.prompt_attn = MultiheadAttention(self.d_model, nhead, dropout=dropout) 
         self.embed_timesteps = nn.Linear(d_model, d_model)
+        self.dropout4 = nn.Dropout(dropout)
+        self.norm4 = nn.LayerNorm(d_model)
 
     # spatial attention block
     def _spatial_mha_block(self, x: Tensor, topology_rel: Optional[Tensor], edge_rel: Optional[Tensor], edge_key_emb, edge_query_emb, edge_value_emb,
@@ -196,6 +199,18 @@ class GraphMotionDecoderLayer(nn.TransformerDecoderLayer):
         attn_output = attn_output.reshape(frames, bs, njoints, feature_len) # njoints, bs, frames, feature_len
         return self.dropout1(attn_output)
     
+        # prompt attention block
+    def _prompt_attention(self, x: Tensor, prompt_embed: Tensor, key_padding_mask: Optional[Tensor]) -> Tensor:
+        frames, bs, njoints, feats= x.size() 
+        x = x.view(frames, bs * njoints, feats)
+
+        prompt_embed = prompt_embed.repeat(bs * njoints, 1, 1)
+        prompt_embed = prompt_embed.permute(1, 0, 2)
+
+        output_attn, output_scores = self.prompt_attn(x, prompt_embed, prompt_embed,
+                                key_padding_mask=key_padding_mask)
+        output_attn = output_attn.view(frames, bs, njoints, feats)
+        return self.dropout4(output_attn)
     
         # temporal attention block
     def _temporal_mha_block_sin_joint(self, x: Tensor, attn_mask: Optional[Tensor], key_padding_mask: Optional[Tensor]) -> Tensor:
@@ -235,6 +250,8 @@ class GraphMotionDecoderLayer(nn.TransformerDecoderLayer):
         spatial_attn_output = self._spatial_mha_block(x, topology_rel, edge_rel, edge_key_emb, edge_query_emb, edge_value_emb,
         topo_key_emb, topo_query_emb, topo_value_emb, spatial_mask, tgt_key_padding_mask, y)
         x = self.norm1(x + spatial_attn_output)
-        x = self.norm2(x + self._temporal_mha_block_sin_joint(x, temporal_mask, tgt_key_padding_mask))
-        x = self.norm3(x + self._ff_block(x))
+        text_embed = y.get('enhanced_text_embed')
+        x = self.norm2(x + self._prompt_attention(x, text_embed, tgt_key_padding_mask))
+        x = self.norm3(x + self._temporal_mha_block_sin_joint(x, temporal_mask, tgt_key_padding_mask))
+        x = self.norm4(x + self._ff_block(x))
         return x

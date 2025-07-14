@@ -10,6 +10,7 @@ from bvh import Bvh
 import matplotlib.pyplot as plt
 from torch_geometric.utils import add_self_loops
 import torch.nn.functional as F
+import models.classifier.provider as provider
 
 
 warnings.filterwarnings("ignore")
@@ -106,7 +107,7 @@ class TruebonesDataset(Dataset):
                 'Comodoa': 65, 'Pirrana': 22, 'Crow': 29, 'Spider': 71, 'Buzzard': 62,
                 'Pigeon': 9, 'Hippopotamus': 41, 'Turtle': 50, 'Cricket': 54, 'Dog-2': 131,
                 'Leapord': 48, 'Rhino': 44, 'Rat': 18, 'Roach': 46, 'Gazelle': 42
-            }.items() if v < 50 and v > 20
+            }.items() #if v < 50 and v > 20
         }
 
         self.df = pd.read_csv(os.path.join(root, 'TrueboneZ-OO.csv')).dropna()
@@ -175,7 +176,10 @@ class TruebonesDataset(Dataset):
         archive = np.load(os.path.join(self.root, group, npz_file))
 
         frame_ids = [int(k.split('_')[1]) for k in archive.keys() if k.startswith('frame_')]
-        frame = np.random.choice(frame_ids)
+        if self.split == 'train':
+            frame = np.random.choice(frame_ids)
+        else:
+            frame = frame_ids[0]
 
         verts_key = f'frame_{frame}_vertices'
         joints_key = f'frame_{frame}_joints'
@@ -184,14 +188,23 @@ class TruebonesDataset(Dataset):
         joints = archive[joints_key]
         weights = skin_data['weights']
 
+        # Augmentation 
+        if self.split == 'train':
+            points_joint = np.expand_dims(np.concatenate((verts, joints), axis=0), axis=0)
+            points_joint = provider.shift_point_cloud(provider.random_scale_point_cloud(points_joint))
+
+            verts = points_joint[0, :verts.shape[0], :]
+            joints = points_joint[0, verts.shape[0]:, :]
+        
+        num_verts = verts.shape[0]
+        points = np.concatenate((verts, joints), axis=0)
+        points = pc_normalize(points)
+        verts, joints = points[:num_verts], points[num_verts:]
+
         replace = verts.shape[0] < self.npoints
         idx = np.random.choice(verts.shape[0], self.npoints, replace=replace)
         verts = verts[idx]
         weights = weights[idx]
-
-        points = np.concatenate((verts, joints), axis=0)
-        points = pc_normalize(points)
-        verts, joints = points[:self.npoints], points[self.npoints:]
 
         group_id = self.dict_groups[group]
         joint_indices = self.part_classes[group_id]
@@ -206,14 +219,14 @@ class TruebonesDataset(Dataset):
         final_weights[:, joint_indices] = torch.tensor(weights, dtype=torch.float32)
 
         joint_hierarchy = hierarchy_bvh(os.path.join(self.root, group, row["File"].strip()))
-        tpl_edge_index, _ = add_self_loops(torch.tensor(joint_hierarchy).long(), num_nodes=len(points))
+        tpl_edge_index, _ = add_self_loops(torch.tensor(joint_hierarchy).long(), num_nodes=len(joint_indices))
         N = tpl_edge_index.shape[1]
-        if N < 2300:
-            padding_needed = 2300 - N
+        if N < 2600:
+            padding_needed = 2600 - N
             pad_tuple = (0, padding_needed, 0, 0)
             tpl_edge_index = F.pad(tpl_edge_index, pad_tuple, "constant", 0)
 
-        return verts, group_id, mask, final_joints, final_weights, tpl_edge_index, N
+        return verts, group_id, mask, final_joints, final_weights, tpl_edge_index, N, index
 
     def __len__(self):
         return len(self.df)

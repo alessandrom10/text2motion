@@ -1,14 +1,13 @@
-from models.diffusion.models.anytop import AnyTop
+from models.diffusion.models.diffusion import MotionDiffusion
 from utils.diffusion import gaussian_diffusion as gd
 from utils.diffusion.respace import SpacedDiffusion, space_timesteps
 
 def load_model(model, state_dict):
     missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
     assert len(unexpected_keys) == 0
-    assert all([k.startswith('clip_model.') for k in missing_keys])
 
 def create_model_and_diffusion_general_skeleton(args):
-    model = AnyTop(**get_gmdm_args(args))
+    model = MotionDiffusion(**get_gmdm_args(args))
     diffusion = create_gaussian_diffusion(args)
     return model, diffusion
 

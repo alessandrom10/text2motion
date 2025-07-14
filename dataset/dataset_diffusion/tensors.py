@@ -98,6 +98,10 @@ def truebones_collate(batch):
 
     if 'graph_dist' in notnone_batches[0]:
         graphdistbatch = [b['graph_dist'] for b in notnone_batches]
+    
+    if 'text_embed_pos' in notnone_batches[0] and notnone_batches[0]['text_embed_pos'] is not None:
+        textembedbatch = [b['text_embed_pos'] for b in notnone_batches]
+        cond['y'].update({'text_embed_pos': torch.stack(textembedbatch)})
 
     cond['y'].update({'joints_mask': jointsmaskbatchTensor})
     cond['y'].update({'n_joints': jointsnumbatchTensor})
@@ -107,7 +111,7 @@ def truebones_collate(batch):
     return motion, cond
 
 """ recieves list of tuples of the form: 
- motion, m_length, parents, tpos_first_frame, offsets, self.temporal_mask_template, joints_graph_dist, joints_relations, object_type, joints_names_embs, ind, mean, std, max_joints, text_embed, real_text
+ motion, m_length, parents, tpos_first_frame, offsets, self.temporal_mask_template, joints_graph_dist, joints_relations, object_type, joints_names_embs, ind, mean, std, max_joints, text_embed, real_text, text_embed_pos
 """
 def truebones_batch_collate(batch):
     max_joints = batch[0][13]
@@ -132,6 +136,7 @@ def truebones_batch_collate(batch):
         object_type = b[8]
         text_embed = b[14] if len(b) > 14 else None
         real_text = b[15] if len(b) > 15 else None
+        text_embed_pos = b[16] if len(b) > 16 else None
 
         item = {
             'inp': motion.permute(1, 2, 0).float(), # [seqlen , J, 13] -> [J, 13,  seqlen]
@@ -148,8 +153,9 @@ def truebones_batch_collate(batch):
             'mean': mean,
             'std': std,
             'text_embed': text_embed,
-            'real_text': real_text
-        } 
+            'real_text': real_text,
+            'text_embed_pos': text_embed_pos
+        }
         adapted_batch.append(item)
 
     return truebones_collate(adapted_batch)

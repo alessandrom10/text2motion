@@ -57,13 +57,15 @@ def main():
 
     # Create data loader
     print("Creating data loader...")
-    data = get_dataset_loader(
+    sbert_loader = get_dataset_loader(
         batch_size=args.batch_size,
         num_frames=args.num_frames,
+        split='train',
         temporal_window=args.temporal_window,
         t5_name="t5-base",
-        balanced=args.balanced,
-        objects_subset=args.objects_subset
+        balanced=False,  # SBERT loader does not need to be balanced
+        objects_subset=args.objects_subset,
+        dataset_type='PairedMotionDataset'  # Use PairedMotionDataset for SBERT pairing
     )
 
     # Create model and diffusion components
@@ -73,7 +75,7 @@ def main():
 
     # Start training
     print("Training...")
-    TrainLoop(args, model, diffusion, data).run_loop()
+    TrainLoop(args, model, diffusion, sbert_loader).run_loop()
 
 
 if __name__ == "__main__":
