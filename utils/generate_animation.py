@@ -62,8 +62,8 @@ def main(args = None, cond_dict = None):
     model.to(dist_util.dev())
     model.eval()  # disable random masking
 
-    texts = ["run"]
-    sbert = SentenceTransformer("all-mpnet-base-v2")
+    texts = ["attack"]
+    sbert = SentenceTransformer("all-MiniLM-L6-v2")
     embeddings = sbert.encode(texts, convert_to_tensor=True)
 
     cond_dict["Tyranno"]["embed_texts"] = [embeddings.reshape(-1)]
@@ -138,6 +138,8 @@ def create_condition(object_types, cond_dict, n_frames, temporal_window, t5_cond
         joints_graph_dist = cond_dict[object_type]['joints_graph_dist']
         offsets = cond_dict[object_type]['offsets']
         
+
+        print("object type:", object_type)
         embed_text = cond_dict[object_type]['embed_texts']
         real_text = cond_dict[object_type]['real_texts']
         # randomly take an element from the embed_texts
