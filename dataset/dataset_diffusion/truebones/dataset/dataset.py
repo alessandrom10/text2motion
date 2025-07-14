@@ -136,21 +136,34 @@ class MotionDataset(data.Dataset):
         mean = self.cond_dict[y['object_type']]['mean']
         std = self.cond_dict[y['object_type']]['std']
         return x * std + mean
-    
+
     def augment(self, data):
         object_type = data['object_type']
         mean = self.cond_dict[object_type]['mean']
         std = self.cond_dict[object_type]['std']
 
         # augment embed_text randomly masking some tokens
-        embed_text = data['embed_text']
         if random.random() < 0.5:
             mask_prob = 0.15
-            mask_indices = np.random.rand(embed_text.shape[0]) < mask_prob
-            embed_text[mask_indices] = 0.0
+            mask_indices = np.random.rand(data['embed_text'].shape[0]) < mask_prob
+            data['embed_text'][mask_indices] = 0.0
 
+        if object_type != "Dragon":
+            aug_type = random.choice([0, 1, 2])
+        else: 
+            aug_type = random.choice([0, 1])
 
-        return data['motion'], data['length'], data['object_type'], data['parents'], data['joints_graph_dist'], data['joints_relations'], data['tpos_first_frame'], data['offsets'], data['joints_names_embs'], data['kinematic_chains'], data['embed_text'], mean, std
+        # augmentation on joints
+        if aug_type == 0:
+            return data['motion'], data['length'], data['object_type'], data['parents'], data['joints_graph_dist'], data['joints_relations'], data['tpos_first_frame'], data['offsets'], data['joints_names_embs'], data['kinematic_chains'], data['embed_text'], mean, std
+        elif aug_type == 1: # remove_joints
+            removal_rate = random.choice([0.1, 0.2, 0.3])
+            motion, length, object_type, parents, joints_graph_dist, joints_relations, tpos_first_frame, offsets, joints_names_embs, kinematic_chains, mean, std = remove_joints_augmentation(data, removal_rate, mean, std) 
+        else: #add joint
+            motion, length, object_type, parents, joints_graph_dist, joints_relations, tpos_first_frame, offsets, joints_names_embs, kinematic_chains, mean, std = add_joint_augmentation(data, mean, std)
+
+        return motion, length, object_type, parents, joints_graph_dist, joints_relations, tpos_first_frame, offsets, joints_names_embs, kinematic_chains, data['embed_text'], mean, std
+
         
         
     def __len__(self):

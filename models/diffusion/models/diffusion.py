@@ -25,7 +25,7 @@ def create_sin_embedding(positions: torch.Tensor, dim: int, max_period: float = 
     phase = positions / (max_period_tensor ** (adim / (half_dim - 1)))
     return torch.cat([torch.cos(phase), torch.sin(phase)], dim=-1)
 
-class AnyTop(nn.Module):
+class MotionDiffusion(nn.Module):
     def __init__(self, max_joints, feature_len,
                  latent_dim=256, ff_size=1024, num_layers=8, num_heads=4, dropout=0.1,
                  activation="gelu", t5_out_dim = 512, root_input_feats=13,
@@ -46,8 +46,6 @@ class AnyTop(nn.Module):
         self.cond_mask_prob = kargs.get('cond_mask_prob', 0.)
         self.skip_t5=kargs.get('skip_t5', False)
         self.value_emb=kargs.get('value_emb', False)
-        
-        self.sbert_enhancer = nn.Linear(384, self.latent_dim)
 
         self.input_process = InputProcess(self.input_feats, self.root_input_feats, self.latent_dim, t5_out_dim, skip_t5=self.skip_t5)
 
@@ -59,8 +57,11 @@ class AnyTop(nn.Module):
                                                             activation=self.activation)
         self.seqTransDecoder = GraphMotionDecoder(seqTransDecoderLayer,
                                                         num_layers=self.num_layers, value_emb=self.value_emb)
-            
         
+        self.sbert_enhancer = nn.Sequential(
+            nn.Linear(384, self.latent_dim)
+        )
+
         self.output_process = OutputProcess(self.feature_len, self.root_input_feats, self.max_joints, self.latent_dim)
 
     def forward(self, x, timesteps, get_layer_activation=-1, y=None):

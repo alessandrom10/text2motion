@@ -99,7 +99,7 @@ def truebones_collate(batch):
     if 'graph_dist' in notnone_batches[0]:
         graphdistbatch = [b['graph_dist'] for b in notnone_batches]
     
-    if 'text_embed_pos' in notnone_batches[0]:
+    if 'text_embed_pos' in notnone_batches[0] and notnone_batches[0]['text_embed_pos'] is not None:
         textembedbatch = [b['text_embed_pos'] for b in notnone_batches]
         cond['y'].update({'text_embed_pos': torch.stack(textembedbatch)})
 

@@ -78,11 +78,11 @@ def add_model_options(parser):
     group.add_argument("--emb_trans_dec", default=False, type=bool,
                        help="For trans_dec architecture only, if true, will inject condition as a class token"
                             " (in addition to cross-attention).")
-    group.add_argument("--layers", default=4, type=int,
+    group.add_argument("--layers", default=3, type=int,
                        help="Number of layers.")
     group.add_argument("--latent_dim", default=128, type=int,
                        help="Transformer/GRU width.")
-    group.add_argument("--cond_mask_prob", default=.1, type=float,
+    group.add_argument("--cond_mask_prob", default=.01, type=float,
                        help="The probability of masking the condition during training."
                             " For classifier-free guidance learning.")
     group.add_argument("--lambda_fs", default=0.0, type=float, help="Foot contact loss.")
@@ -162,7 +162,7 @@ def add_generate_options(parser):
     group.add_argument("--motion_length", default=6.0, type=float,
                        help="The length of the sampled motion [in seconds]. "
                             "Maximum is 9.8 for HumanML3D (text-to-motion), and 2.0 for HumanAct12 (action-to-motion)")
-    group.add_argument("--object_type", default=['Flamingo'], type=str, nargs='+',
+    group.add_argument("--object_type", required=True, type=str, nargs='+',
                        help="An object type to be generated. If empty, will generate flamingo :).")
 
 
