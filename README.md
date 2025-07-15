@@ -24,6 +24,7 @@ Follow these instructions to get the project up and running on your local machin
     ```bash
       conda env create -f environment.yaml
       conda activate text2motion
+      pip install torch-scatter -f https://data.pyg.org/whl/torch-2.4.1+cu121.html
       pip install git+https://github.com/inbar-2344/Motion.git
     ```
 2. **Download the dataset**

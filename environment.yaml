@@ -102,3 +102,7 @@ dependencies:
       - urllib3==2.2.3
       - wasabi==0.10.1
       - zipp==3.20.2
+      - sentence_transformers==3.2.1
+      - pandas==2.0.3
+      - bvh==0.3
+      - torch-geometric==2.6.1
