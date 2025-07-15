@@ -5,7 +5,6 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset
-import trimesh
 from bvh import Bvh
 import matplotlib.pyplot as plt
 from torch_geometric.utils import add_self_loops
