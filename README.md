@@ -1,4 +1,6 @@
 # Text2Motion
+*This project was designed for the Advanced Deep Learning course held at the Politecnico di Milano.*
+
 <img src="assets/tyranno_attacks.gif" width="400"/>
 
 A tyrannosaurus attacks
